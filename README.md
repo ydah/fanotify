@@ -85,6 +85,7 @@ The default behavior is fail-open:
 - `close` allows an unanswered event before closing its descriptors.
 - If a response cannot be written, the notifier closes the whole group to release
   every process still waiting on it.
+- `close` interrupts threads blocked in `read_events` with `Fanotify::Error`.
 
 `on_error: :deny` changes only the handler-exception decision. It is intentionally
 opt-in because application bugs then deny access.

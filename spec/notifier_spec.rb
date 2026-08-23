@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "timeout"
+
 RSpec.describe Fanotify::Notifier do
   let(:handle) { instance_double(Fanotify::Native::Descriptor, close: nil, closed?: false, read: "buffer") }
 
@@ -101,6 +103,30 @@ RSpec.describe Fanotify::Notifier do
     20.times.map { Thread.new { notifier.close } }.each(&:join)
 
     expect(handle).to have_received(:close).once
+  end
+
+  it "interrupts a blocking reader when closed" do
+    entered = Queue.new
+    allow(handle).to receive(:read) do
+      entered << true
+      sleep
+    end
+    notifier = described_class.new
+    result = Queue.new
+    reader = Thread.new do
+      notifier.read_events
+    rescue Exception => error
+      result << error
+    end
+
+    entered.pop
+    Timeout.timeout(1) { notifier.close }
+    Timeout.timeout(1) { reader.join }
+
+    expect(result.pop).to be_a(Fanotify::Error)
+  ensure
+    reader&.kill
+    reader&.join
   end
 
   it "enables all flags required for target FID reports" do

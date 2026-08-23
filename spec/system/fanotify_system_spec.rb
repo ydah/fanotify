@@ -138,6 +138,26 @@ RSpec.describe "fanotify system integration" do
     expect(wait_for_child(pid, reader)).to eq("gvl:interruptible")
   end
 
+  it "interrupts a blocking read when closed from another thread" do
+    notifier = Fanotify::Notifier.new(class: :notif, report: [:fid])
+    result = Queue.new
+    read_thread = Thread.new do
+      notifier.read_events
+    rescue Exception => error
+      result << error
+    end
+    Thread.pass until read_thread.status == "sleep"
+
+    notifier.close
+    Timeout.timeout(1) { read_thread.join }
+
+    expect(result.pop).to be_a(Fanotify::Error)
+  ensure
+    read_thread&.kill
+    read_thread&.join
+    notifier&.close
+  end
+
   it "rejects descriptor reuse after close" do
     notifier = Fanotify::Notifier.new(class: :notif, report: [:fid])
     notifier.close

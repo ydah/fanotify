@@ -112,6 +112,8 @@ module Fanotify
       @pending = {}
       @pending_mutex = Mutex.new
       @response_mutex = Mutex.new
+      @readers = {}
+      @readers_condition = ConditionVariable.new
       @closing = false
       @exclude_self = false
     end
@@ -141,7 +143,7 @@ module Fanotify
         raise ArgumentError, "timeout must be a non-negative finite number or nil"
       end
 
-      buffer = @handle.read(timeout)
+      buffer = read_buffer(timeout)
       return [] unless buffer
 
       begin
@@ -226,6 +228,14 @@ module Fanotify
         return if @closing || closed?
 
         @closing = close_token
+        @readers.each_key do |reader|
+          reader.raise(Error, "notifier is closed") unless reader == Thread.current
+        rescue ThreadError
+          nil
+        end
+      end
+      @response_mutex.synchronize do
+        @readers_condition.wait(@response_mutex) while @readers.any? { |reader, _| reader != Thread.current }
       end
 
       if @watchdog && @watchdog != Thread.current
@@ -252,6 +262,25 @@ module Fanotify
     end
 
     private
+
+    def read_buffer(timeout)
+      reader = Thread.current
+      Thread.handle_interrupt(Exception => :never) do
+        @response_mutex.synchronize do
+          raise Error, "notifier is closed" if @closing || closed?
+
+          @readers[reader] = true
+        end
+        begin
+          Thread.handle_interrupt(Exception => :on_blocking) { @handle.read(timeout) }
+        ensure
+          @response_mutex.synchronize do
+            @readers.delete(reader)
+            @readers_condition.broadcast
+          end
+        end
+      end
+    end
 
     def finish_event(event, decision, suppress_errors: false)
       responded = false
