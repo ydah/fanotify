@@ -233,7 +233,7 @@ module Fanotify
         @watchdog.join
       end
       pending_events.each { |event| finish_event(event, :allow, suppress_errors: true) }
-      @pending_mutex.synchronize { @pending.keys }.each { |object_id| finalize_deferred(object_id) }
+      @pending_mutex.synchronize { @pending.keys }.each { |token| finalize_deferred(token) }
       nil
     ensure
       if @closing.equal?(close_token)
@@ -277,32 +277,39 @@ module Fanotify
     def register_pending(event, event_fd, descriptors)
       deadline = monotonic_time + @response_timeout if @response_timeout
       reference = WeakRef.new(event)
+      token = Object.new
       @response_mutex.synchronize do
         raise Error, "notifier is closed" if @closing || closed?
 
         @pending_mutex.synchronize do
-          @pending[event.object_id] = [reference, deadline, event_fd, descriptors]
+          @pending[token] = [reference, deadline, event_fd, descriptors]
         end
       end
       start_watchdog
+      token
     rescue Exception # Interrupt must not leave a permission event tracked but undeferred.
-      @pending_mutex.synchronize { @pending.delete(event.object_id) }
+      @pending_mutex.synchronize { @pending.delete(token) } if token
       raise
     end
 
-    def unregister_pending(event)
-      @pending_mutex.synchronize { @pending.delete(event.object_id) }
+    def unregister_pending(token)
+      @pending_mutex.synchronize { @pending.delete(token) } if token
     end
 
-    def finalize_deferred(object_id)
-      entry = @pending_mutex.synchronize { @pending.delete(object_id) }
+    def finalize_deferred(token)
+      entry = @pending_mutex.synchronize { @pending.delete(token) }
       return unless entry
 
       _reference, _deadline, event_fd, descriptors = entry
       @response_mutex.synchronize { @handle.respond(event_fd, FAN_ALLOW) unless closed? }
       safely_warn "fanotify deferred event was garbage collected; allowing it"
-    rescue IOError, SystemCallError => error
+    rescue StandardError => error
       safely_warn "fanotify failed to allow garbage-collected event: #{error.message}"
+      begin
+        close
+      rescue StandardError => close_error
+        safely_warn "fanotify failed to close after response error: #{close_error.message}"
+      end
     ensure
       descriptors&.each do |descriptor|
         descriptor.close unless descriptor.closed?
@@ -328,16 +335,16 @@ module Fanotify
         expired, collected = @pending_mutex.synchronize do
           live = []
           dead = []
-          @pending.each do |object_id, (reference, deadline, _event_fd, _descriptors)|
+          @pending.each do |token, (reference, deadline, _event_fd, _descriptors)|
             if (event = dereference(reference))
               live << event if deadline && deadline <= now
             else
-              dead << object_id
+              dead << token
             end
           end
           [live, dead]
         end
-        collected.each { |object_id| finalize_deferred(object_id) }
+        collected.each { |token| finalize_deferred(token) }
         expired.each do |event|
           if finish_event(event, :allow, suppress_errors: true)
             safely_warn "fanotify response timeout expired; allowing event"

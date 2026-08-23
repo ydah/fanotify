@@ -57,6 +57,7 @@ RSpec.describe "permission event safety" do
     value = event(notifier:)
 
     expect { value.allow!(audit: "yes") }.to raise_error(ArgumentError, /true or false/)
+    expect(handle).not_to have_received(:close)
     value.deny!(audit: true)
 
     expect(handle).to have_received(:respond).with(37, Fanotify::FAN_DENY | Fanotify::FAN_AUDIT)
@@ -70,6 +71,16 @@ RSpec.describe "permission event safety" do
     expect(notifier.pending_events).to eq([value])
     value.allow!
     expect(notifier.pending_events).to be_empty
+  end
+
+  it "tracks deferred events with non-reusable tokens" do
+    value = event(notifier:)
+    value.defer!
+
+    keys = notifier.instance_variable_get(:@pending).keys
+    expect(keys.length).to eq(1)
+    expect(keys.first).not_to eq(value.object_id)
+    value.allow!
   end
 
   it "fails open when deferred registration raises" do
@@ -250,6 +261,19 @@ RSpec.describe "permission event safety" do
     pid_writer&.close
   end
 
+  it "closes the notification group when a collected event cannot be allowed" do
+    value = event(notifier:)
+    value.defer!
+    allow(handle).to receive(:respond).and_raise(IOError, "response failed")
+    value = nil
+
+    expect do
+      3.times { GC.start }
+      Timeout.timeout(1) { sleep 0.01 while notifier.instance_variable_get(:@watchdog)&.alive? }
+    end.to output(/failed to allow garbage-collected event/).to_stderr_from_any_process
+    expect(handle).to have_received(:close)
+  end
+
   it "does not remove dead tracking entries before watchdog cleanup" do
     object = Object.new
     reference = WeakRef.new(object)
@@ -360,6 +384,25 @@ RSpec.describe "permission event safety" do
     expect(handle).to have_received(:respond).with(37, Fanotify::FAN_ALLOW)
     expect(value).to be_closed
     expect { value.path }.to raise_error(Fanotify::Error, /closed/)
+  end
+
+  it "closes the notification group when a final response fails" do
+    value = event(notifier:)
+    allow(handle).to receive(:respond).and_raise(IOError, "response failed")
+
+    expect { value.close }.to raise_error(IOError, "response failed")
+    expect(value).to be_closed
+    expect(handle).to have_received(:close)
+  end
+
+  it "closes the notification group when an explicit response fails" do
+    value = event(notifier:)
+    allow(handle).to receive(:respond).and_raise(IOError, "response failed")
+
+    expect { value.allow! }.to raise_error(IOError, "response failed")
+    expect(value).not_to be_responded
+    expect(value).to be_closed
+    expect(handle).to have_received(:close)
   end
 
   it "closes a permission event exactly once across concurrent callers" do

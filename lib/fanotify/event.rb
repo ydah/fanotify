@@ -105,8 +105,8 @@ module Fanotify
         return self if deferred?
 
         Thread.handle_interrupt(Exception => :never) do
-          notifier.__send__(:register_pending, self, @event_fd,
-                            [@file_descriptor, @pidfd_descriptor].compact)
+          @pending_token = notifier.__send__(:register_pending, self, @event_fd,
+                                             [@file_descriptor, @pidfd_descriptor].compact)
           @deferred = true
         end
       end
@@ -124,10 +124,11 @@ module Fanotify
           close_error = nil
           if deferred?
             begin
-              notifier.__send__(:unregister_pending, self)
+              notifier.__send__(:unregister_pending, @pending_token)
             rescue StandardError => error
               close_error ||= error
             ensure
+              @pending_token = nil
               @deferred = false
             end
           end
@@ -141,6 +142,9 @@ module Fanotify
         end
         nil
       end
+    rescue Exception # Closing the group is the only remaining fail-open response.
+      fail_open_notifier
+      raise
     end
 
     private
@@ -150,11 +154,21 @@ module Fanotify
       raise Error, "event is not associated with a notifier" unless notifier
       raise ArgumentError, "audit must be true or false" unless audit == true || audit == false
 
-      @response_mutex.synchronize do
-        raise Error, "event is closed" if closed?
-        raise Error, "event has already been responded to" if responded?
+      begin
+        @response_mutex.synchronize do
+          raise Error, "event is closed" if closed?
+          raise Error, "event has already been responded to" if responded?
 
-        respond_without_lock(response, audit:)
+          respond_without_lock(response, audit:)
+        end
+      rescue Exception
+        fail_open_notifier
+        begin
+          close unless responded? || closed?
+        rescue Exception
+          nil
+        end
+        raise
       end
       self
     end
@@ -163,9 +177,16 @@ module Fanotify
       Thread.handle_interrupt(Exception => :never) do
         notifier.__send__(:respond_to_event, @event_fd, response | (audit ? FAN_AUDIT : 0))
         @responded = true
-        notifier.__send__(:unregister_pending, self)
+        notifier.__send__(:unregister_pending, @pending_token)
+        @pending_token = nil
         @deferred = false
       end
+    end
+
+    def fail_open_notifier
+      notifier.close if permission? && !responded? && notifier
+    rescue Exception
+      nil
     end
 
     def apply_info(info, own_fds:)

@@ -35,6 +35,7 @@ struct parse_context {
 static VALUE mFanotify;
 static VALUE mNative;
 static VALUE cDescriptor;
+static VALUE eError;
 static VALUE eUnsupported;
 
 void fanotify_define_constants(VALUE module);
@@ -114,7 +115,7 @@ static descriptor_t *get_descriptor(VALUE self)
 {
     descriptor_t *descriptor;
     TypedData_Get_Struct(self, descriptor_t, &descriptor_type, descriptor);
-    if (descriptor->fd < 0) rb_raise(rb_eIOError, "closed descriptor");
+    if (descriptor->fd < 0) rb_raise(eError, "closed descriptor");
     return descriptor;
 }
 
@@ -461,6 +462,7 @@ static VALUE native_parse(int argc, VALUE *argv, VALUE self)
 void Init_fanotify(void)
 {
     mFanotify = rb_define_module("Fanotify");
+    eError = rb_const_get(mFanotify, rb_intern("Error"));
     eUnsupported = rb_const_get(mFanotify, rb_intern("UnsupportedError"));
     mNative = rb_define_module_under(mFanotify, "Native");
     cDescriptor = rb_define_class_under(mNative, "Descriptor", rb_cObject);

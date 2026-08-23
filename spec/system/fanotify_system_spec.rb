@@ -138,6 +138,13 @@ RSpec.describe "fanotify system integration" do
     expect(wait_for_child(pid, reader)).to eq("gvl:interruptible")
   end
 
+  it "rejects descriptor reuse after close" do
+    notifier = Fanotify::Notifier.new(class: :notif, report: [:fid])
+    notifier.close
+
+    expect { notifier.fileno }.to raise_error(Fanotify::Error, /closed/)
+  end
+
   it "processes an event with GC stress enabled" do
     previous_stress = GC.stress
     GC.stress = true

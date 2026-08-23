@@ -83,6 +83,8 @@ The default behavior is fail-open:
   cleanup remains active.
 - `pending_events` exposes live deferred events.
 - `close` allows an unanswered event before closing its descriptors.
+- If a response cannot be written, the notifier closes the whole group to release
+  every process still waiting on it.
 
 `on_error: :deny` changes only the handler-exception decision. It is intentionally
 opt-in because application bugs then deny access.
