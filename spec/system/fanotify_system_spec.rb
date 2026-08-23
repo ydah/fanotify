@@ -21,7 +21,8 @@ RSpec.describe "fanotify system integration" do
       skip "fanotify is unavailable"
     end
 
-    @directory = Dir.mktmpdir("fanotify-system-")
+    pre_access_root = ENV["FANOTIFY_PRE_ACCESS_ROOT"] if RSpec.current_example.metadata[:pre_access]
+    @directory = pre_access_root ? Dir.mktmpdir("fanotify-system-", pre_access_root) : Dir.mktmpdir("fanotify-system-")
     @path = File.join(@directory, "payload")
     File.write(@path, "payload")
   end
@@ -326,7 +327,7 @@ RSpec.describe "fanotify system integration" do
     expect { IO.for_fd(pidfd, autoclose: false).stat }.to raise_error(Errno::EBADF)
   end
 
-  it "materializes the requested pre-access range" do
+  it "materializes the requested pre-access range", :pre_access do
     @notifier = Fanotify::Notifier.new(
       class: :pre_content,
       event_flags: %i[rdwr largefile cloexec],
@@ -336,7 +337,7 @@ RSpec.describe "fanotify system integration" do
     reader, writer = IO.pipe
     pid = fork_child do
       reader.close
-      writer.write("ok:#{File.open(@path) { |file| file.read(4) }}")
+      writer.write("ok:#{File.open(@path) { |file| file.sysread(4) }}")
     rescue StandardError => error
       writer.write("error:#{error.class.name}")
     ensure

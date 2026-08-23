@@ -6,7 +6,7 @@ if [[ ${FANOTIFY_REQUIRE_PRE_ACCESS:-0} == 1 ]]; then
   mkfs.ext4 -q -F /tmp/fanotify-pre-access.ext4
   mkdir -p /tmp/fanotify-pre-access
   mount -o loop /tmp/fanotify-pre-access.ext4 /tmp/fanotify-pre-access
-  export TMPDIR=/tmp/fanotify-pre-access
+  export FANOTIFY_PRE_ACCESS_ROOT=/tmp/fanotify-pre-access
 fi
 
 bundle exec rake compile test:system
