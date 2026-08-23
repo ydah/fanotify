@@ -55,7 +55,7 @@ module Fanotify
   class Notifier
     PERMISSION_EVENTS = %i[open_perm access_perm open_exec_perm pre_access].freeze
     PERMISSION_MASK = PERMISSION_EVENTS.reduce(0) { |mask, event| mask | EVENT_MASKS.fetch(event) }
-    FID_EVENTS = %i[create delete moved_from moved_to rename].freeze
+    FID_EVENTS = %i[attrib create delete delete_self moved_from moved_to move_self rename].freeze
     MARK_ACTIONS = {add: FAN_MARK_ADD, remove: FAN_MARK_REMOVE}.freeze
     MARK_TARGETS = {inode: FAN_MARK_INODE, mount: FAN_MARK_MOUNT, filesystem: FAN_MARK_FILESYSTEM}.freeze
 
@@ -75,11 +75,11 @@ module Fanotify
     def initialize(**options)
       klass = options.delete(:class) || :notif
       @report = Array(options.delete(:report)).map(&:to_sym)
-      nonblock = options.delete(:nonblock) || false
+      nonblock = options.key?(:nonblock) ? options.delete(:nonblock) : false
       @nonblock = nonblock
-      unlimited_queue = options.delete(:unlimited_queue) || false
-      unlimited_marks = options.delete(:unlimited_marks) || false
-      audit = options.delete(:audit) || false
+      unlimited_queue = options.key?(:unlimited_queue) ? options.delete(:unlimited_queue) : false
+      unlimited_marks = options.key?(:unlimited_marks) ? options.delete(:unlimited_marks) : false
+      audit = options.key?(:audit) ? options.delete(:audit) : false
       event_flags = Array(options.delete(:event_flags) || %i[rdonly largefile cloexec]).map(&:to_sym)
       @on_overflow = options.delete(:on_overflow)
       @on_error = options.delete(:on_error)
@@ -90,7 +90,7 @@ module Fanotify
       unless [nonblock, unlimited_queue, unlimited_marks, audit].all? { |value| value == true || value == false }
         raise ArgumentError, "boolean options must be true or false"
       end
-      if @on_overflow && !@on_overflow.respond_to?(:call)
+      unless @on_overflow.nil? || @on_overflow.respond_to?(:call)
         raise ArgumentError, "on_overflow must be callable or nil"
       end
       raise ArgumentError, "on_error must be :allow or :deny" unless %i[allow deny].include?(@on_error)
@@ -116,6 +116,9 @@ module Fanotify
     end
 
     def mark(action, path, events:, on: :inode, follow: true, only_dir: false)
+      unless [follow, only_dir].all? { |value| value == true || value == false }
+        raise ArgumentError, "follow and only_dir must be true or false"
+      end
       mark = Mark.new(action: action.to_sym, path: File.path(path), events: Array(events).map(&:to_sym),
                       on: on.to_sym, follow:, only_dir:)
       validate_mark!(mark)
@@ -191,24 +194,42 @@ module Fanotify
 
     def pending_events
       @pending_mutex.synchronize do
-        @pending.values.filter_map do |reference, _deadline|
-          reference.__getobj__ if reference.weakref_alive?
-        end
+        @pending.values.filter_map { |reference, _deadline| dereference(reference) }
       end
     end
 
-    def to_io = @handle.to_io
+    def to_io
+      @response_mutex.synchronize do
+        raise Error, "notifier is closed" if closed?
+
+        @io = @handle.to_io.dup unless @io && !@io.closed?
+        @io
+      end
+    end
+
     def fileno = @handle.fileno
     def closed? = @handle.closed?
 
     def close
       return if closed?
 
-      @watchdog&.kill
-      @watchdog&.join
+      if @watchdog && @watchdog != Thread.current
+        @watchdog.kill
+        @watchdog.join
+      end
       pending_events.each { |event| finish_event(event, :allow, suppress_errors: true) }
+      nil
     ensure
-      @handle.close unless @handle.closed?
+      active_error = $!
+      close_error = nil
+      @response_mutex.synchronize do
+        [@io, @handle].each do |resource|
+          resource&.close unless resource&.closed?
+        rescue StandardError => error
+          close_error ||= error
+        end
+      end
+      raise close_error if !active_error && close_error
     end
 
     private
@@ -288,9 +309,7 @@ module Fanotify
         sleep interval
         now = monotonic_time
         expired = @pending_mutex.synchronize do
-          @pending.values.filter_map do |reference, deadline|
-            reference.__getobj__ if deadline <= now && reference.weakref_alive?
-          end
+          @pending.values.filter_map { |reference, deadline| dereference(reference) if deadline <= now }
         end
         expired.each do |event|
           if finish_event(event, :allow, suppress_errors: true)
@@ -307,9 +326,15 @@ module Fanotify
 
     def monotonic_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
+    def dereference(reference)
+      reference.__getobj__
+    rescue WeakRef::RefError
+      nil
+    end
+
     def safely_warn(message)
       warn message
-    rescue StandardError
+    rescue Exception # Warning failures must not kill the fail-open watchdog.
       nil
     end
 
@@ -343,6 +368,9 @@ module Fanotify
       end
       if mark.events.include?(:fs_error) && (mark.on != :filesystem || !fid_reporting?)
         raise ArgumentError, "fs_error requires filesystem mark and FID reporting"
+      end
+      if mark.on == :mount && (mark.events & FID_EVENTS).any?
+        raise ArgumentError, "#{(mark.events & FID_EVENTS).join(', ')} cannot use a mount mark"
       end
       return if (mark.events & FID_EVENTS).empty? || (@report & %i[fid dir_fid dfid_name]).any?
 

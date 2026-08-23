@@ -141,7 +141,7 @@ on Ruby 3.4.10, Linux 6.8 arm64 in a Docker Desktop VM. Run
 `bundle exec ruby benchmark/events.rb` on the deployment host; handler work and event
 shape dominate real throughput.
 
-See `examples/` for audit, permission-scan, and experimental pre-access programs.
+See `examples/` for audit logging, malware scanning, and experimental pre-access programs.
 
 ## License
 

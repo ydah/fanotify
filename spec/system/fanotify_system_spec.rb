@@ -6,8 +6,13 @@ require "tmpdir"
 
 RSpec.describe "fanotify system integration" do
   before do
+    @children = []
     skip "Linux only" unless RUBY_PLATFORM.include?("linux")
-    skip "fanotify is unavailable" unless Fanotify.supported?
+    unless Fanotify.supported?
+      raise "fanotify is unavailable" if ENV["FANOTIFY_REQUIRE_PRIVILEGED"] == "1"
+
+      skip "fanotify is unavailable"
+    end
 
     @directory = Dir.mktmpdir("fanotify-system-")
     @path = File.join(@directory, "payload")
@@ -15,8 +20,19 @@ RSpec.describe "fanotify system integration" do
   end
 
   after do
-    @notifier&.close
-    FileUtils.remove_entry(@directory) if @directory && File.exist?(@directory)
+    begin
+      @notifier&.close
+    ensure
+      Array(@children).each do |pid|
+        next if Process.waitpid(pid, Process::WNOHANG)
+
+        Process.kill(:KILL, pid)
+        Process.wait(pid)
+      rescue Errno::ECHILD, Errno::ESRCH
+        nil
+      end
+      FileUtils.remove_entry(@directory) if @directory && File.exist?(@directory)
+    end
   end
 
   def permission_notifier(response_timeout: 1.0, on_error: :allow, report: [])
@@ -24,12 +40,18 @@ RSpec.describe "fanotify system integration" do
     @notifier.mark(:add, @directory, events: %i[open_perm event_on_child], only_dir: true)
     @notifier
   rescue Errno::EPERM, Errno::EACCES => error
+    raise if ENV["FANOTIFY_REQUIRE_PRIVILEGED"] == "1"
+
     skip "CAP_SYS_ADMIN is required: #{error.message}"
+  end
+
+  def fork_child(&block)
+    fork(&block).tap { |pid| @children << pid }
   end
 
   def fork_read
     reader, writer = IO.pipe
-    pid = fork do
+    pid = fork_child do
       reader.close
       result = File.read(@path)
       writer.write("ok:#{result}")
@@ -84,12 +106,14 @@ RSpec.describe "fanotify system integration" do
     expect(wait_for_child(pid, reader)).to eq("ok:payload")
     event.close
   rescue Errno::EPERM, Errno::EACCES => error
+    raise if ENV["FANOTIFY_REQUIRE_PRIVILEGED"] == "1"
+
     skip "fanotify notification permission denied: #{error.message}"
   end
 
   it "releases the GVL and interrupts a blocking read" do
     reader, writer = IO.pipe
-    pid = fork do
+    pid = fork_child do
       reader.close
       notifier = Fanotify::Notifier.new(class: :notif, report: [:fid])
       read_thread = Thread.new { notifier.read_events }
@@ -142,6 +166,8 @@ RSpec.describe "fanotify system integration" do
     expect(event.dfid).to be_a(Fanotify::FileHandle)
     event.close
   rescue Errno::EPERM, Errno::EACCES => error
+    raise if ENV["FANOTIFY_REQUIRE_PRIVILEGED"] == "1"
+
     skip "fanotify FID permission denied: #{error.message}"
   end
 
@@ -161,13 +187,15 @@ RSpec.describe "fanotify system integration" do
     expect(event.fid).to be_a(Fanotify::FileHandle)
     event.close
   rescue Errno::EINVAL => error
+    raise if ENV["FANOTIFY_REQUIRE_PRIVILEGED"] == "1"
+
     skip "FAN_RENAME target FID is unavailable: #{error.message}"
   end
 
   it "creates an unprivileged FID notifier" do
     File.chmod(0o755, @directory)
     reader, writer = IO.pipe
-    pid = fork do
+    pid = fork_child do
       reader.close
       Process::GID.change_privilege(65_534)
       Process::UID.change_privilege(65_534)
@@ -188,7 +216,7 @@ RSpec.describe "fanotify system integration" do
   it "does not leak descriptors across 10,000 fd events" do
     permission_notifier(response_timeout: nil)
     baseline = Dir.children("/proc/self/fd").length
-    pid = fork do
+    pid = fork_child do
       10_000.times { File.open(@path, &:read) }
       exit!
     end
@@ -213,7 +241,7 @@ RSpec.describe "fanotify system integration" do
     paths.each { |path| File.write(path, "") }
     @notifier = Fanotify::Notifier.new(class: :notif, report: [:fid], nonblock: true)
     @notifier.mark(:add, @directory, events: %i[open event_on_child], only_dir: true)
-    pid = fork do
+    pid = fork_child do
       paths.each { |path| File.open(path, &:read) }
       exit!
     end
@@ -272,7 +300,7 @@ RSpec.describe "fanotify system integration" do
     )
     @notifier.mark(:add, @path, events: [:pre_access])
     reader, writer = IO.pipe
-    pid = fork do
+    pid = fork_child do
       reader.close
       writer.write("ok:#{File.open(@path) { |file| file.read(4) }}")
     rescue StandardError => error
@@ -291,6 +319,8 @@ RSpec.describe "fanotify system integration" do
     expect(wait_for_child(pid, reader)).to eq("ok:data")
     event.close
   rescue Errno::EINVAL => error
+    raise if ENV["FANOTIFY_REQUIRE_PRE_ACCESS"] == "1"
+
     skip "FAN_PRE_ACCESS requires Linux 6.14+: #{error.message}"
   end
 

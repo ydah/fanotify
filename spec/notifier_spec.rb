@@ -30,7 +30,9 @@ RSpec.describe Fanotify::Notifier do
 
   it "rejects ambiguous booleans, callbacks, and durations" do
     expect { described_class.new(nonblock: "yes") }.to raise_error(ArgumentError, /boolean/)
+    expect { described_class.new(audit: nil) }.to raise_error(ArgumentError, /boolean/)
     expect { described_class.new(on_overflow: Object.new) }.to raise_error(ArgumentError, /callable/)
+    expect { described_class.new(on_overflow: false) }.to raise_error(ArgumentError, /callable/)
     expect { described_class.new(on_error: false) }.to raise_error(ArgumentError, /on_error/)
     expect { described_class.new(response_timeout: false) }.to raise_error(ArgumentError, /positive or nil/)
     expect { described_class.new(response_timeout: Float::INFINITY) }.to raise_error(ArgumentError, /positive or nil/)
@@ -39,6 +41,8 @@ RSpec.describe Fanotify::Notifier do
     expect { notifier.read_events(timeout: "1") }.to raise_error(ArgumentError, /finite number/)
     expect { notifier.read_events(timeout: Float::INFINITY) }.to raise_error(ArgumentError, /finite number/)
     expect { notifier.read_events(timeout: 2_147_484) }.to raise_error(ArgumentError, /finite number/)
+    expect { notifier.mark(:add, "/tmp", events: [:open], follow: "false") }
+      .to raise_error(ArgumentError, /true or false/)
   end
 
   it "rejects permission events for notification class" do
@@ -64,6 +68,8 @@ RSpec.describe Fanotify::Notifier do
       .to raise_error(ArgumentError, /inode mark/)
     expect { notifier.mark(:add, "/tmp", events: [:fs_error], on: :inode) }
       .to raise_error(ArgumentError, /filesystem mark/)
+    expect { notifier.mark(:add, "/tmp", events: [:attrib], on: :mount) }
+      .to raise_error(ArgumentError, /mount mark/)
   end
 
   it "rejects child name events without FID reporting" do
@@ -71,6 +77,22 @@ RSpec.describe Fanotify::Notifier do
 
     expect { notifier.mark(:add, "/tmp", events: [:create]) }
       .to raise_error(ArgumentError, /require FID reporting/)
+    expect { notifier.mark(:add, "/tmp", events: [:delete_self]) }
+      .to raise_error(ArgumentError, /require FID reporting/)
+  end
+
+  it "invalidates the selectable IO when closed" do
+    reader, writer = IO.pipe
+    allow(handle).to receive(:to_io).and_return(reader)
+    notifier = described_class.new
+    io = notifier.to_io
+
+    expect(io.fileno).not_to eq(reader.fileno)
+    expect(notifier.close).to be_nil
+    expect(io).to be_closed
+  ensure
+    reader&.close unless reader&.closed?
+    writer&.close unless writer&.closed?
   end
 
   it "enables all flags required for target FID reports" do

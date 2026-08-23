@@ -5,11 +5,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <poll.h>
 #include <unistd.h>
+#endif
 
 #define READ_BUFFER_SIZE (4096 * 16)
 
@@ -161,6 +163,10 @@ struct read_args {
 static void *read_without_gvl(void *pointer)
 {
     struct read_args *args = pointer;
+#ifdef _WIN32
+    args->result = -1;
+    args->error = ENOSYS;
+#else
     struct pollfd pollfd = {args->fd, POLLIN, 0};
 
     if (args->timeout_ms >= 0) {
@@ -174,6 +180,7 @@ static void *read_without_gvl(void *pointer)
 
     args->result = read(args->fd, args->buffer, READ_BUFFER_SIZE);
     args->error = args->result < 0 ? errno : 0;
+#endif
     return NULL;
 }
 

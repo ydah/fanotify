@@ -4,11 +4,21 @@
 #include <fcntl.h>
 #include <stdint.h>
 
+#ifdef _WIN32
+#include <io.h>
+#define close _close
+#define read _read
+#define write _write
+#endif
+
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
 #endif
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
+#endif
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 0
 #endif
 #ifndef AT_FDCWD
 #define AT_FDCWD -100

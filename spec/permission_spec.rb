@@ -56,6 +56,7 @@ RSpec.describe "permission event safety" do
   it "supports explicit audited responses" do
     value = event(notifier:)
 
+    expect { value.allow!(audit: "yes") }.to raise_error(ArgumentError, /true or false/)
     value.deny!(audit: true)
 
     expect(handle).to have_received(:respond).with(37, Fanotify::FAN_DENY | Fanotify::FAN_AUDIT)
@@ -139,7 +140,7 @@ RSpec.describe "permission event safety" do
 
   it "answers timed out events even when warning output raises" do
     timed_notifier = Fanotify::Notifier.new(class: :content, response_timeout: 0.01)
-    allow(timed_notifier).to receive(:warn).and_raise(IOError, "stderr failed")
+    allow(timed_notifier).to receive(:warn).and_raise(Exception, "stderr failed")
     value = event(notifier: timed_notifier)
 
     value.defer!
@@ -182,6 +183,17 @@ RSpec.describe "permission event safety" do
 
     expect(notifier.pending_events).to be_empty
     expect(pending).to have_key(123)
+  ensure
+    pending&.delete(123)
+  end
+
+  it "ignores a weak reference that dies during lookup" do
+    reference = instance_double(WeakRef)
+    allow(reference).to receive(:__getobj__).and_raise(WeakRef::RefError)
+    pending = notifier.instance_variable_get(:@pending)
+    pending[123] = [reference, nil]
+
+    expect(notifier.pending_events).to be_empty
   ensure
     pending&.delete(123)
   end

@@ -59,6 +59,26 @@ jobs:
           bundler-cache: true
       - name: Install VM runner
         run: sudo apt-get update && sudo apt-get install -y busybox-static qemu-system-x86 virtme-ng zstd
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - name: Run privileged tests in kernel VM
         timeout-minutes: 30
-        run: vng -v -r ${{ matrix.kernel }} -- bundle exec rake compile test:system
+        run: vng -v -r ${{ matrix.kernel }} --user root -- env FANOTIFY_REQUIRE_PRIVILEGED=1 FANOTIFY_REQUIRE_PRE_ACCESS=${{ matrix.kernel == 'v6.14' && '1' || '0' }} bundle exec rake compile test:system
+
+  portability:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      - run: bundle exec rake test:unit

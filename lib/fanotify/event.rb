@@ -124,6 +124,7 @@ module Fanotify
       raise Error, "not a permission event" unless permission?
       raise Error, "event is closed" if closed?
       raise Error, "event is not associated with a notifier" unless notifier
+      raise ArgumentError, "audit must be true or false" unless audit == true || audit == false
 
       @response_mutex.synchronize do
         raise Error, "event has already been responded to" if responded?
