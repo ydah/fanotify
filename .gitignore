@@ -8,6 +8,8 @@
 /pkg/
 /spec/reports/
 /tmp/
+/lib/fanotify/*.bundle
+/lib/fanotify/*.so
 Gemfile.lock
 .rspec_status
 *.gem
