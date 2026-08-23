@@ -352,10 +352,10 @@ RSpec.describe "fanotify system integration" do
     event.allow!
     expect(wait_for_child(pid, reader)).to eq("ok:data")
     event.close
-  rescue Errno::EINVAL => error
+  rescue Errno::EINVAL, Errno::ENOTSUP => error
     raise if ENV["FANOTIFY_REQUIRE_PRE_ACCESS"] == "1"
 
-    skip "FAN_PRE_ACCESS requires Linux 6.14+: #{error.message}"
+    skip "FAN_PRE_ACCESS requires Linux 6.14+ and an HSM-capable filesystem: #{error.message}"
   end
 
   it "automatically allows when a handler returns" do

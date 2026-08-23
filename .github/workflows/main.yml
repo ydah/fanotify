@@ -58,7 +58,7 @@ jobs:
           ruby-version: '3.4'
           bundler-cache: true
       - name: Install VM runner
-        run: sudo apt-get update && sudo apt-get install -y busybox-static qemu-system-x86 virtme-ng zstd
+        run: sudo apt-get update && sudo apt-get install -y busybox-static e2fsprogs qemu-system-x86 virtme-ng zstd
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -66,7 +66,20 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - name: Run privileged tests in kernel VM
         timeout-minutes: 30
-        run: vng -v -r ${{ matrix.kernel }} --user root -- env PATH="$PATH" FANOTIFY_EXPECT_KERNEL=${{ matrix.kernel }} FANOTIFY_REQUIRE_PRIVILEGED=1 FANOTIFY_REQUIRE_PRE_ACCESS=${{ matrix.kernel == 'v6.14' && '1' || '0' }} bundle exec rake compile test:system
+        run: |
+          # Variables in the single-quoted script expand inside the guest.
+          # shellcheck disable=SC2016
+          vng -v -r ${{ matrix.kernel }} --user root -- env PATH="$PATH" FANOTIFY_EXPECT_KERNEL=${{ matrix.kernel }} FANOTIFY_REQUIRE_PRIVILEGED=1 FANOTIFY_REQUIRE_PRE_ACCESS=${{ matrix.kernel == 'v6.14' && '1' || '0' }} bash -c '
+            set -e
+            if [ "$FANOTIFY_REQUIRE_PRE_ACCESS" = "1" ]; then
+              truncate -s 64M /tmp/fanotify-pre-access.ext4
+              mkfs.ext4 -q -F /tmp/fanotify-pre-access.ext4
+              mkdir -p /mnt/fanotify-pre-access
+              mount -o loop /tmp/fanotify-pre-access.ext4 /mnt/fanotify-pre-access
+              export TMPDIR=/mnt/fanotify-pre-access
+            fi
+            bundle exec rake compile test:system
+          '
 
   portability:
     strategy:
