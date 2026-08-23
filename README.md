@@ -1,38 +1,85 @@
-# Fanotify
+<h1 align="center">Fanotify</h1>
+
+<p align="center">
+  <strong>Safe Ruby bindings for Linux fanotify</strong>
+</p>
+
+<p align="center">
+  <a href="https://rubygems.org/gems/fanotify"><img src="https://img.shields.io/gem/v/fanotify.svg?colorB=319e8c" alt="Gem Version"></a>
+  <a href="https://rubygems.org/gems/fanotify"><img src="https://img.shields.io/gem/dt/fanotify.svg" alt="Downloads"></a>
+  <a href="https://github.com/ydah/fanotify/actions/workflows/main.yml"><img src="https://github.com/ydah/fanotify/actions/workflows/main.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/ruby-%3E%3D%203.2-ruby.svg" alt="Ruby Version">
+  <img src="https://img.shields.io/badge/platform-Linux-yellow.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License">
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#installation">Installation</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#permission-events">Permission Events</a> ·
+  <a href="#development">Development</a>
+</p>
+
+---
+
+Fanotify provides Ruby 3.2+ C bindings for Linux `fanotify(7)`. It monitors
+filesystem activity, reports file identity and name records, and safely handles
+permission decisions that can block other processes.
 
 > [!WARNING]
-> Permission events block the process that opened a file until userspace responds.
-> A missing response or filesystem access from the handler can deadlock a process or
-> the machine. `Fanotify::Notifier#each_event` fails open and closes event descriptors,
-> but handlers must still follow the safety rules below.
+> Permission events block the process accessing a file until userspace responds.
+> A missing response or filesystem access from the handler can deadlock a process
+> or the machine. `Fanotify::Notifier#each_event` fails open and closes event
+> descriptors, but handlers must still follow the safety rules below.
 
-Ruby 3.2+ C bindings for Linux `fanotify(7)`. The gem supports ordinary
-notifications, permission decisions, FID/name records, PIDFD records, rename
-records, filesystem errors, and queue-overflow detection.
+## Features
 
-## Requirements
-
-- Linux 5.1+ and a kernel built with `CONFIG_FANOTIFY`.
-- `CAP_SYS_ADMIN` for mount/filesystem marks and all permission events.
-- Linux 5.9+ for FID reporting, 5.13+ for unprivileged FID notification groups,
-  5.15+ for PIDFD reports, 5.17+ for rename/target FID reports, and 6.14+ for
-  experimental pre-access events.
-- A C compiler and Linux UAPI headers when installing the gem.
-
-`Fanotify.supported?` checks whether the syscall exists. It does not prove that the
-current process has permission for a particular class or mark.
+- High-level file watching with `Fanotify.watch`
+- Notification and permission event groups
+- Safe allow, deny, deferred, timeout, and fail-open decisions
+- FID, filename, rename, target FID, and PIDFD records
+- Filesystem error and queue-overflow reporting
+- Linux 6.14 pre-access range events for hierarchical storage managers
+- Native extension with no runtime gem dependencies
 
 ## Installation
+
+Add the gem to your Gemfile:
 
 ```ruby
 gem "fanotify"
 ```
 
-Then run `bundle install`. The native extension is built during installation.
+Then install it:
 
-## Notifications
+```sh
+bundle install
+```
 
-The high-level API uses the unprivileged-compatible FID/name mode:
+The native extension is built during installation.
+
+### Requirements
+
+- Linux 5.1+ with `CONFIG_FANOTIFY`
+- Ruby 3.2+
+- A C compiler and Linux UAPI headers
+- `CAP_SYS_ADMIN` for mount/filesystem marks and all permission events
+
+| Feature | Minimum Linux version |
+|---------|-----------------------|
+| FID reporting | 5.9 |
+| Unprivileged FID notification groups | 5.13 |
+| PIDFD reports | 5.15 |
+| Rename and target FID reports | 5.17 |
+| Experimental pre-access events | 6.14 |
+
+`Fanotify.supported?` checks whether the syscall exists. It does not prove that
+the current process can create a particular group or mark.
+
+## Quick Start
+
+Watch a directory for ordinary notifications:
 
 ```ruby
 require "fanotify"
@@ -42,7 +89,7 @@ Fanotify.watch("/data", events: %i[create delete modify]) do |event|
 end
 ```
 
-Use `Notifier` for explicit classes and marks:
+Use `Notifier` when you need explicit classes, reports, or mark flags:
 
 ```ruby
 Fanotify::Notifier.open(class: :notif, report: %i[fid dfid_name]) do |notifier|
@@ -51,14 +98,11 @@ Fanotify::Notifier.open(class: :notif, report: %i[fid dfid_name]) do |notifier|
 end
 ```
 
-`Event#fid`, `#dfid`, `#old_dfid`, and `#new_dfid` are `Fanotify::FileHandle`
-values. Handles are comparable and printable as hex, but v1 does not open them with
+`Event#fid`, `#dfid`, `#old_dfid`, and `#new_dfid` are comparable
+`Fanotify::FileHandle` values printable as hex. Version 1 does not open them with
 `open_by_handle_at(2)`.
 
-Linux 6.14 pre-access events expose the requested byte range as
-`Event#range_offset` and `Event#range_count`; see `examples/lazy_fetch.rb`.
-
-## Permission decisions
+## Permission Events
 
 Permission marks require `CAP_SYS_ADMIN`:
 
@@ -74,48 +118,61 @@ Fanotify::Notifier.open(class: :content, response_timeout: 5.0) do |notifier|
 end
 ```
 
+### Failure Behavior
+
 The default behavior is fail-open:
 
-- A permission event without `allow!` or `deny!` is allowed after the block.
-- A handler exception allows the event before the same exception is raised again.
-- `defer!` registers an asynchronous decision. The default watchdog allows it after
-  five seconds; `response_timeout: nil` disables the deadline, while GC fail-open
-  cleanup remains active.
+- An unanswered permission event is allowed after the handler block returns.
+- A handler exception allows the event before re-raising the same exception.
+- `defer!` registers an asynchronous decision. The watchdog allows it after five
+  seconds by default. `response_timeout: nil` disables the deadline, while GC
+  fail-open cleanup remains active.
 - `pending_events` exposes live deferred events.
-- `close` allows an unanswered event before closing its descriptors.
-- If a response cannot be written, the notifier closes the whole group to release
-  every process still waiting on it.
-- `close` interrupts threads blocked in `read_events` with `Fanotify::Error`.
+- `close` allows unanswered events and interrupts threads blocked in `read_events`
+  with `Fanotify::Error`.
+- A failed response write closes the entire notification group, releasing every
+  process waiting on it.
 
-`on_error: :deny` changes only the handler-exception decision. It is intentionally
-opt-in because application bugs then deny access.
+`on_error: :deny` changes only the handler-exception decision. It is opt-in
+because application errors then deny filesystem access.
 
-### Handler safety
+### Handler Safety
 
 - Load code, resolve configuration, and open log destinations before adding a
-  permission mark. Do not call `require`, open logs, or lazily load files in a handler.
-- `exclude_self!` filters self-generated events already read by the notifier. It cannot
-  rescue a handler that blocks itself while opening another marked file on the same
-  thread.
-- Inspect `event.file`, which duplicates the kernel-opened descriptor and is closed
+  permission mark. Do not call `require`, open logs, or lazily load files inside
+  the handler.
+- Call `exclude_self!` to filter self-generated events already read by the
+  notifier. It cannot rescue a handler that blocks itself while opening another
+  marked file on the same thread.
+- Inspect `event.file`, which duplicates the kernel-opened descriptor and closes
   with the event. Do not reopen `event.path` for a security decision.
-- `event.path` comes from `/proc/self/fd/N` and is informational. Reopening it has a
-  TOCTOU race. Deleted paths retain the kernel's `" (deleted)"` suffix.
-- Keep handlers bounded. The kernel has no response timeout; the gem watchdog covers
-  only events explicitly deferred through this notifier.
+- Treat `event.path` as informational. It comes from `/proc/self/fd/N`, reopening
+  it has a TOCTOU race, and deleted paths keep the kernel's `" (deleted)"` suffix.
+- Keep handlers bounded. The kernel has no response timeout; the gem watchdog
+  covers only events deferred through this notifier.
 
-## Unsupported and restricted environments
+### Pre-access Events
 
-- macOS, BSD, and Windows: `require "fanotify"` succeeds and `supported?` is false;
-  constructing a notifier raises `Fanotify::UnsupportedError`.
-- Docker/Podman containers: permission events and mount/filesystem marks normally fail
-  without `CAP_SYS_ADMIN`; Docker Desktop also runs inside a Linux VM.
-- GitHub-hosted runners: unit tests work normally, but system tests need the included
-  virtme-ng VM runner.
-- WSL2: availability depends on its kernel configuration and the capabilities granted
-  to the process.
-- Older Linux kernels accept only the flags available in that kernel; unsupported new
-  flag combinations fail with the kernel's `Errno::*` exception.
+Linux 6.14 pre-access events expose the kernel-reported access range through
+`Event#range_offset` and `Event#range_count`. The range can be larger than the
+application-level read request. These events also require an HSM-capable
+filesystem such as ext4, XFS, or Btrfs. See [`examples/lazy_fetch.rb`](examples/lazy_fetch.rb).
+
+## Platform Notes
+
+| Environment | Behavior |
+|-------------|----------|
+| macOS, BSD, Windows | `require "fanotify"` succeeds and `supported?` is false; constructing a notifier raises `Fanotify::UnsupportedError`. |
+| Docker or Podman | Permission events and mount/filesystem marks normally require `CAP_SYS_ADMIN`; Docker Desktop runs inside a Linux VM. |
+| GitHub-hosted runners | Unit tests run normally; system tests use the included virtme-ng kernel VM. |
+| WSL2 | Availability depends on the kernel configuration and process capabilities. |
+| Older Linux kernels | Unsupported flags and combinations raise the kernel's `Errno::*` exception. |
+
+## Examples
+
+- [`examples/audit_logger.rb`](examples/audit_logger.rb) — log filesystem activity
+- [`examples/malware_scan.rb`](examples/malware_scan.rb) — inspect and decide permission events
+- [`examples/lazy_fetch.rb`](examples/lazy_fetch.rb) — materialize Linux 6.14 pre-access ranges
 
 ## Development
 
@@ -126,27 +183,29 @@ bundle exec rake rbs
 sudo bundle exec rake test:system  # Linux with CAP_SYS_ADMIN
 ```
 
-The system suite has hard timeouts and covers notification, allow/deny, exception
-fail-open, deferred timeout, FID names, unprivileged mode, queue overflow, and 10,000
-permission events without fd growth.
+The system suite has hard timeouts and covers notifications, permission
+decisions, exception fail-open, deferred cleanup, FID names, unprivileged mode,
+queue overflow, and descriptor leak detection.
 
-Run the same suite in a kernel VM with:
+Run it in a kernel VM with:
 
 ```sh
 tools/vm/run.sh              # Linux 6.12
 KVER=6.1 tools/vm/run.sh
 ```
 
-`bundle exec rake gen:constants` regenerates the Ruby constant bindings. Values are
-still resolved from the target system's UAPI headers at extension build time.
+Regenerate Ruby constant bindings with `bundle exec rake gen:constants`. Values
+are resolved from the target system's UAPI headers when the extension is built.
 
-Reference throughput for 10,000 distinct `FAN_OPEN` FID events was 266,374 events/s
-on Ruby 3.4.10, Linux 6.8 arm64 in a Docker Desktop VM. Run
-`bundle exec ruby benchmark/events.rb` on the deployment host; handler work and event
-shape dominate real throughput.
+Reference throughput for 10,000 distinct `FAN_OPEN` FID events was 266,374
+events/s on Ruby 3.4.10 and Linux 6.8 arm64 in a Docker Desktop VM. Benchmark the
+deployment host with `bundle exec ruby benchmark/events.rb`; handler work and
+event shape dominate real throughput.
 
-See `examples/` for audit logging, malware scanning, and experimental pre-access programs.
+## Contributing
+
+Bug reports and pull requests are welcome at https://github.com/ydah/fanotify.
 
 ## License
 
-[MIT](LICENSE.txt)
+Released under the [MIT License](LICENSE.txt).
