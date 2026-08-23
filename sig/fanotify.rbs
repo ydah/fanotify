@@ -1,0 +1,90 @@
+module Fanotify
+  VERSION: String
+
+  class Error < StandardError
+  end
+
+  class UnsupportedError < Error
+  end
+
+  class PermissionError < Error
+  end
+
+  SystemCallError: singleton(::SystemCallError)
+
+  def self.supported?: () -> bool
+  def self.watch: (String | _ToPath path, ?events: Array[Symbol], **untyped options) { (Event) -> void } -> void
+                | (String | _ToPath path, ?events: Array[Symbol], **untyped options) -> Enumerator[Event, void]
+
+  class FileHandle
+    attr_reader fsid: String
+    attr_reader type: Integer
+    attr_reader bytes: String
+
+    def initialize: (fsid: String, type: Integer, bytes: String) -> void
+    def to_s: () -> String
+  end
+
+  class Mark
+    attr_reader action: Symbol
+    attr_reader path: String
+    attr_reader events: Array[Symbol]
+    attr_reader on: Symbol
+    attr_reader follow: bool
+    attr_reader only_dir: bool
+
+    def initialize: (action: Symbol, path: String, events: Array[Symbol], on: Symbol, follow: bool, only_dir: bool) -> void
+  end
+
+  class Event
+    attr_reader raw_mask: Integer
+    attr_reader pid: Integer?
+    attr_reader notifier: Notifier?
+    attr_reader fid: FileHandle?
+    attr_reader dfid: FileHandle?
+    attr_reader name: String?
+    attr_reader pidfd: Integer?
+    attr_reader old_dfid: FileHandle?
+    attr_reader old_name: String?
+    attr_reader new_dfid: FileHandle?
+    attr_reader new_name: String?
+    attr_reader error: Integer?
+    attr_reader error_count: Integer?
+
+    def self.parse: (String buffer, ?notifier: Notifier?, ?own_fds: bool) -> Array[Event]
+    def mask: () -> Array[Symbol]
+    def file: () -> IO?
+    def path: () -> String?
+    def process_path: () -> String?
+    def deleted?: () -> bool
+    def overflow?: () -> bool
+    def permission?: () -> bool
+    def responded?: () -> bool
+    def deferred?: () -> bool
+    def closed?: () -> bool
+    def allow!: (?audit: bool) -> self
+    def deny!: (?audit: bool) -> self
+    def defer!: () -> self
+    def close: () -> nil
+  end
+
+  class Notifier
+    attr_reader report: Array[Symbol]
+
+    def self.new: (**untyped options) -> Notifier
+    def self.open: (**untyped options) { (Notifier) -> untyped } -> untyped
+                 | (**untyped options) -> Notifier
+    def initialize: (**untyped options) -> void
+    def mark: (Symbol action, String | _ToPath path, events: Array[Symbol], ?on: Symbol, ?follow: bool, ?only_dir: bool) -> self
+    def flush: (?Symbol on) -> self
+    def read_events: (?timeout: Numeric?) -> Array[Event]
+    def each_event: () { (Event) -> void } -> void
+                  | () -> Enumerator[Event, void]
+    def exclude_self!: () -> self
+    def pending_events: () -> Array[Event]
+    def to_io: () -> IO
+    def fileno: () -> Integer
+    def closed?: () -> bool
+    def close: () -> nil
+  end
+end

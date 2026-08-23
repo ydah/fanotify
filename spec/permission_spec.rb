@@ -100,5 +100,7 @@ RSpec.describe "permission event safety" do
     value.close
 
     expect(handle).to have_received(:respond).with(37, Fanotify::FAN_ALLOW)
+    expect(value).to be_closed
+    expect { value.path }.to raise_error(Fanotify::Error, /closed/)
   end
 end

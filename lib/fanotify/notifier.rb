@@ -51,6 +51,7 @@ module Fanotify
     ondir: FAN_ONDIR
   }.freeze
 
+  # Owns a fanotify group and provides safe event iteration.
   class Notifier
     PERMISSION_EVENTS = %i[open_perm access_perm open_exec_perm pre_access].freeze
     PERMISSION_MASK = PERMISSION_EVENTS.reduce(0) { |mask, event| mask | EVENT_MASKS.fetch(event) }
@@ -79,7 +80,7 @@ module Fanotify
       unlimited_queue = options.delete(:unlimited_queue) || false
       unlimited_marks = options.delete(:unlimited_marks) || false
       audit = options.delete(:audit) || false
-      event_flags = options.delete(:event_flags) || %i[rdonly largefile cloexec]
+      event_flags = Array(options.delete(:event_flags) || %i[rdonly largefile cloexec]).map(&:to_sym)
       @on_overflow = options.delete(:on_overflow)
       @on_error = (options.delete(:on_error) || :allow).to_sym
       @response_timeout = options.key?(:response_timeout) ? options.delete(:response_timeout) : 5.0
@@ -90,13 +91,15 @@ module Fanotify
       end
 
       validate_report!
+      access_modes = event_flags & %i[rdonly wronly rdwr]
+      raise ArgumentError, "event_flags require exactly one access mode" unless access_modes.one?
       @class = klass.to_sym
       flags = fetch(CLASS_FLAGS, @class, "class") | flags_for(@report, REPORT_FLAGS, "report")
       flags |= FAN_NONBLOCK if nonblock
       flags |= FAN_UNLIMITED_QUEUE if unlimited_queue
       flags |= FAN_UNLIMITED_MARKS if unlimited_marks
       flags |= FAN_ENABLE_AUDIT if audit
-      @handle = Native.open(flags, flags_for(Array(event_flags), EVENT_FLAGS, "event flag"))
+      @handle = Native.open(flags, flags_for(event_flags, EVENT_FLAGS, "event flag"))
       @pending = {}
       @pending_mutex = Mutex.new
       @response_mutex = Mutex.new
@@ -181,7 +184,8 @@ module Fanotify
       @watchdog&.kill
       @watchdog&.join
       pending_events.each { |event| finish_event(event, :allow) }
-      @handle.close
+    ensure
+      @handle.close unless @handle.closed?
     end
 
     private
@@ -192,7 +196,7 @@ module Fanotify
     rescue StandardError => response_error
       raise unless suppress_errors
 
-      warn "fanotify failed to #{decision} event while handling another error: #{response_error.message}"
+      warn "fanotify failed to #{decision} event: #{response_error.message}"
     end
 
     def respond_to_event(event, event_fd, response)
@@ -243,7 +247,7 @@ module Fanotify
           end
           expired.each do |event|
             warn "fanotify response timeout expired; allowing event"
-            finish_event(event, :allow)
+            finish_event(event, :allow, suppress_errors: true)
           end
         end
       end
@@ -267,6 +271,10 @@ module Fanotify
       if @class == :notif && (mark.events & PERMISSION_EVENTS).any?
         raise ArgumentError, "permission events require :content or :pre_content class"
       end
+      if mark.events.include?(:pre_access) && @class != :pre_content
+        raise ArgumentError, "pre_access requires :pre_content class"
+      end
+      raise ArgumentError, "overflow is receive-only" if mark.events.include?(:overflow)
       return if (mark.events & FID_EVENTS).empty? || (@report & %i[fid dir_fid dfid_name]).any?
 
       raise ArgumentError, "#{(mark.events & FID_EVENTS).join(', ')} require FID reporting"

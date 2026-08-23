@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 module Fanotify
+  # One parsed fanotify event and any descriptors owned by it.
   class Event
     INFO_FID = 1
     INFO_DFID_NAME = 2
@@ -33,9 +34,14 @@ module Fanotify
       EVENT_MASKS.filter_map { |name, value| name if (raw_mask & value).positive? }
     end
 
-    def file = @file_descriptor&.to_io
+    def file
+      raise Error, "event is closed" if closed?
+
+      @file_descriptor&.to_io
+    end
 
     def path
+      raise Error, "event is closed" if closed?
       return unless @event_fd
 
       File.readlink("/proc/self/fd/#{@event_fd}")
@@ -56,6 +62,7 @@ module Fanotify
     def permission? = (raw_mask & Notifier::PERMISSION_MASK).positive?
     def responded? = @responded || false
     def deferred? = @deferred || false
+    def closed? = @closed || false
 
     def allow!(audit: false) = respond!(FAN_ALLOW, audit:)
     def deny!(audit: false) = respond!(FAN_DENY, audit:)
@@ -73,11 +80,14 @@ module Fanotify
     end
 
     def close
+      return if closed?
+
       begin
         allow! if permission? && !responded? && notifier
       ensure
         @file_descriptor&.close unless @file_descriptor&.closed?
         @pidfd_descriptor&.close unless @pidfd_descriptor&.closed?
+        @closed = true
       end
       nil
     end

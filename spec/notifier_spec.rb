@@ -21,11 +21,25 @@ RSpec.describe Fanotify::Notifier do
     expect { described_class.new(report: [:target_fid]) }.to raise_error(ArgumentError, /requires :dfid_name/)
   end
 
+  it "requires one event descriptor access mode" do
+    expect { described_class.new(event_flags: [:cloexec]) }.to raise_error(ArgumentError, /one access mode/)
+    expect { described_class.new(event_flags: %i[wronly rdwr]) }.to raise_error(ArgumentError, /one access mode/)
+  end
+
   it "rejects permission events for notification class" do
     notifier = described_class.new
 
     expect { notifier.mark(:add, "/tmp", events: [:open_perm]) }
       .to raise_error(ArgumentError, /permission events require/)
+  end
+
+  it "restricts pre-access and receive-only masks" do
+    notifier = described_class.new(class: :content)
+
+    expect { notifier.mark(:add, "/tmp", events: [:pre_access]) }
+      .to raise_error(ArgumentError, /pre_content/)
+    expect { notifier.mark(:add, "/tmp", events: [:overflow]) }
+      .to raise_error(ArgumentError, /receive-only/)
   end
 
   it "rejects child name events without FID reporting" do

@@ -11,12 +11,15 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  unit:
     runs-on: ubuntu-latest
     name: Ruby ${{ matrix.ruby }}
     strategy:
       matrix:
         ruby:
+          - '3.2'
+          - '3.3'
+          - '3.4'
           - '4.0'
 
     steps:
@@ -29,4 +32,31 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
       - name: Run the default task
-        run: bundle exec rake
+        run: bundle exec rake test:unit
+      - name: Validate RBS
+        if: matrix.ruby == '3.4'
+        run: bundle exec rake rbs
+
+  system:
+    runs-on: ubuntu-24.04
+    name: Linux ${{ matrix.kernel }} system tests
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel:
+          - v6.1
+          - v6.12
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      - name: Install VM runner
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 virtme-ng
+      - name: Run privileged tests in kernel VM
+        run: vng -v -r ${{ matrix.kernel }} -- bundle exec rake compile test:system

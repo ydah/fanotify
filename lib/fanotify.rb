@@ -7,6 +7,7 @@ module Fanotify
   class Error < StandardError; end
   class UnsupportedError < Error; end
   class PermissionError < Error; end
+  SystemCallError = ::SystemCallError
 end
 
 require "fanotify/fanotify"
