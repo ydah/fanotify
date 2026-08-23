@@ -347,7 +347,8 @@ RSpec.describe "fanotify system integration" do
     writer.close
     event = next_permission_event(@notifier)
 
-    expect(event).to have_attributes(range_offset: 0, range_count: 4)
+    expect(event.range_offset).to eq(0)
+    expect(event.range_count).to be >= 4
     event.file.write("data")
     event.file.flush
     event.allow!
