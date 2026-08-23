@@ -231,6 +231,7 @@ module Fanotify
       if @watchdog && @watchdog != Thread.current
         @watchdog.kill
         @watchdog.join
+        @watchdog = nil
       end
       pending_events.each { |event| finish_event(event, :allow, suppress_errors: true) }
       @pending_mutex.synchronize { @pending.keys }.each { |token| finalize_deferred(token) }
@@ -284,8 +285,8 @@ module Fanotify
         @pending_mutex.synchronize do
           @pending[token] = [reference, deadline, event_fd, descriptors]
         end
+        start_watchdog
       end
-      start_watchdog
       token
     rescue Exception # Interrupt must not leave a permission event tracked but undeferred.
       @pending_mutex.synchronize { @pending.delete(token) } if token

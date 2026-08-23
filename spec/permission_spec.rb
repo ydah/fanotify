@@ -165,6 +165,32 @@ RSpec.describe "permission event safety" do
     expect(notifier.pending_events).to be_empty
   end
 
+  it "does not leave a watchdog running when close races with registration" do
+    timed_notifier = Fanotify::Notifier.new(class: :content, response_timeout: 100)
+    value = event(notifier: timed_notifier)
+    entered = Queue.new
+    release = Queue.new
+    allow(timed_notifier).to receive(:start_watchdog).and_wrap_original do |method|
+      entered << true
+      release.pop
+      method.call
+    end
+    defer_thread = Thread.new { value.defer! }
+
+    entered.pop
+    close_thread = Thread.new { timed_notifier.close }
+    Timeout.timeout(1) { Thread.pass until close_thread.status == "sleep" }
+    release << true
+    [defer_thread, close_thread].each(&:join)
+
+    expect(timed_notifier.instance_variable_get(:@watchdog)).to be_nil
+  ensure
+    release&.push(true) if defer_thread&.alive?
+    defer_thread&.join
+    close_thread&.join
+    timed_notifier&.close
+  end
+
   it "closes every pending event when one response fails" do
     values = [event(notifier:, fd: 50), event(notifier:, fd: 51)]
     values.each(&:defer!)
