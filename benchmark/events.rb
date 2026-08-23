@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-require "benchmark"
 require "fanotify"
 require "tmpdir"
 
@@ -15,13 +14,13 @@ Dir.mktmpdir("fanotify-benchmark-") do |directory|
     notifier.mark(:add, directory, events: %i[open event_on_child], only_dir: true)
     child = fork { paths.each { |path| File.open(path, &:read) } }
     received = 0
-    elapsed = Benchmark.realtime do
-      until received >= count
-        events = notifier.read_events
-        received += events.length
-        events.each(&:close)
-      end
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    until received >= count
+      events = notifier.read_events
+      received += events.length
+      events.each(&:close)
     end
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
     Process.wait(child)
     puts format("%d events in %.3fs (%.0f events/s)", received, elapsed, received / elapsed)
   end

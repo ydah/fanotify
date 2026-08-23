@@ -8,15 +8,17 @@ module Fanotify
     INFO_DFID = 3
     INFO_PIDFD = 4
     INFO_ERROR = 5
+    INFO_RANGE = 6
     INFO_OLD_DFID_NAME = 10
     INFO_NEW_DFID_NAME = 12
 
     attr_reader :raw_mask, :pid, :notifier, :fid, :dfid, :name, :pidfd,
-                :old_dfid, :old_name, :new_dfid, :new_name, :error, :error_count
+                :pidfd_error, :old_dfid, :old_name, :new_dfid, :new_name,
+                :error, :error_count, :range_offset, :range_count
 
     class << self
       def parse(buffer, notifier: nil, own_fds: false)
-        Native.parse(buffer).map { |attributes| new(attributes, notifier:, own_fds:) }
+        Native.parse(buffer, own_fds).map { |attributes| new(attributes, notifier:, own_fds:) }
       end
     end
 
@@ -26,7 +28,7 @@ module Fanotify
       @notifier = notifier
       @event_fd = attributes[:fd] unless attributes[:fd] == FAN_NOFD
       @response_mutex = Mutex.new
-      @file_descriptor = Native.wrap(@event_fd) if own_fds && @event_fd
+      @file_descriptor = attributes[:file_descriptor] if own_fds
       attributes.fetch(:infos).each { |info| apply_info(info, own_fds:) }
     end
 
@@ -75,7 +77,7 @@ module Fanotify
       return self if deferred?
 
       @deferred = true
-      notifier.__send__(:register_pending, self, @event_fd)
+      notifier.__send__(:register_pending, self, @event_fd, @file_descriptor)
       self
     end
 
@@ -116,9 +118,14 @@ module Fanotify
       when INFO_OLD_DFID_NAME then @old_dfid, @old_name = file_handle(info), info[:name]
       when INFO_NEW_DFID_NAME then @new_dfid, @new_name = file_handle(info), info[:name]
       when INFO_PIDFD
-        @pidfd = info[:pidfd] unless info[:pidfd] == FAN_NOFD
-        @pidfd_descriptor = Native.wrap(@pidfd) if own_fds && @pidfd
+        if info[:pidfd].negative?
+          @pidfd_error = info[:pidfd]
+        else
+          @pidfd = info[:pidfd]
+          @pidfd_descriptor = info[:pidfd_descriptor] if own_fds
+        end
       when INFO_ERROR then @error, @error_count = info.values_at(:error, :error_count)
+      when INFO_RANGE then @range_offset, @range_count = info.values_at(:range_offset, :range_count)
       end
     end
 

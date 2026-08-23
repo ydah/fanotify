@@ -7,12 +7,26 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #define READ_BUFFER_SIZE (4096 * 16)
 
 typedef struct { int fd; } descriptor_t;
+struct owned_fd {
+    int fd;
+    VALUE descriptor;
+    struct owned_fd *next;
+};
+struct parse_context {
+    VALUE buffer;
+    VALUE descriptor_roots;
+    int own_fds;
+    struct owned_fd *owned_head;
+    struct owned_fd *owned_tail;
+    struct owned_fd *owned_cursor;
+};
 
 static VALUE mFanotify;
 static VALUE mNative;
@@ -45,6 +59,51 @@ static VALUE descriptor_wrap(int fd)
     VALUE object = TypedData_Make_Struct(cDescriptor, descriptor_t, &descriptor_type, descriptor);
     descriptor->fd = fd;
     return object;
+}
+
+static VALUE tracked_descriptor(struct parse_context *context, int fd)
+{
+    struct owned_fd *owned = malloc(sizeof(*owned));
+    if (!owned) {
+        close(fd);
+        rb_memerror();
+    }
+    owned->fd = fd;
+    owned->descriptor = Qnil;
+    owned->next = NULL;
+    if (context->owned_tail) context->owned_tail->next = owned;
+    else context->owned_head = owned;
+    context->owned_tail = owned;
+    owned->descriptor = descriptor_wrap(fd);
+    rb_ary_push(context->descriptor_roots, owned->descriptor);
+    return owned->descriptor;
+}
+
+static VALUE prepared_descriptor(struct parse_context *context, int fd)
+{
+    struct owned_fd *owned = context->owned_cursor;
+    if (!owned || owned->fd != fd) rb_raise(rb_eRuntimeError, "fanotify descriptor tracking mismatch");
+    context->owned_cursor = owned->next;
+    return owned->descriptor;
+}
+
+static void release_tracked_descriptors(struct parse_context *context, int close_fds)
+{
+    struct owned_fd *owned = context->owned_head;
+    while (owned) {
+        struct owned_fd *next = owned->next;
+        if (close_fds) {
+            if (!NIL_P(owned->descriptor)) {
+                descriptor_t *descriptor;
+                TypedData_Get_Struct(owned->descriptor, descriptor_t, &descriptor_type, descriptor);
+                descriptor->fd = -1;
+            }
+            close(owned->fd);
+        }
+        free(owned);
+        owned = next;
+    }
+    context->owned_head = context->owned_tail = context->owned_cursor = NULL;
 }
 
 static descriptor_t *get_descriptor(VALUE self)
@@ -120,30 +179,25 @@ static VALUE descriptor_read(VALUE self, VALUE timeout)
 {
     descriptor_t *descriptor = get_descriptor(self);
     struct read_args args;
-    VALUE result;
+    VALUE result = rb_str_new(NULL, READ_BUFFER_SIZE);
 
     args.fd = descriptor->fd;
     args.timeout_ms = NIL_P(timeout) ? -1 : NUM2INT(rb_funcall(timeout, rb_intern("*"), 1, INT2NUM(1000)));
     if (args.timeout_ms < -1) rb_raise(rb_eArgError, "timeout must be non-negative");
-    args.buffer = ALLOC_N(char, READ_BUFFER_SIZE);
+    args.buffer = RSTRING_PTR(result);
 
     rb_thread_call_without_gvl(read_without_gvl, &args, RUBY_UBF_IO, NULL);
     if (args.result < 0 && (args.error == EAGAIN || args.error == EWOULDBLOCK)) {
-        xfree(args.buffer);
         return Qnil;
     }
     if (args.result < 0) {
-        int error = args.error;
-        xfree(args.buffer);
-        rb_syserr_fail(error, "read(fanotify)");
+        rb_syserr_fail(args.error, "read(fanotify)");
     }
     if (args.result == 0) {
-        xfree(args.buffer);
         return Qnil;
     }
 
-    result = rb_str_new(args.buffer, args.result);
-    xfree(args.buffer);
+    rb_str_set_len(result, args.result);
     return result;
 }
 
@@ -203,12 +257,6 @@ static VALUE native_open(VALUE self, VALUE flags, VALUE event_flags)
 #endif
 }
 
-static VALUE native_wrap(VALUE self, VALUE fd)
-{
-    (void)self;
-    return descriptor_wrap(NUM2INT(fd));
-}
-
 static VALUE hash(void)
 {
     return rb_hash_new();
@@ -219,7 +267,7 @@ static void set(VALUE target, const char *key, VALUE value)
     rb_hash_aset(target, ID2SYM(rb_intern(key)), value);
 }
 
-static VALUE parse_info(const unsigned char *bytes, size_t length)
+static VALUE parse_info(const unsigned char *bytes, size_t length, struct parse_context *context)
 {
     struct fanotify_event_info_header header;
     VALUE info = hash();
@@ -231,6 +279,8 @@ static VALUE parse_info(const unsigned char *bytes, size_t length)
         if (length < sizeof(header) + sizeof(pidfd)) rb_raise(rb_eArgError, "truncated PIDFD info record");
         memcpy(&pidfd, bytes + sizeof(header), sizeof(pidfd));
         set(info, "pidfd", INT2NUM(pidfd));
+        if (context->own_fds && pidfd >= 0)
+            set(info, "pidfd_descriptor", prepared_descriptor(context, pidfd));
     } else if (header.info_type == FAN_EVENT_INFO_TYPE_ERROR) {
         int32_t error;
         uint32_t count;
@@ -264,23 +314,64 @@ static VALUE parse_info(const unsigned char *bytes, size_t length)
             if (!nul) rb_raise(rb_eArgError, "unterminated DFID name");
             set(info, "name", rb_str_new((const char *)bytes + name_offset, nul - (bytes + name_offset)));
         }
+    } else if (header.info_type == FAN_EVENT_INFO_TYPE_RANGE) {
+        uint64_t offset;
+        uint64_t count;
+        if (length < sizeof(header) + 4 + sizeof(offset) + sizeof(count))
+            rb_raise(rb_eArgError, "truncated RANGE info record");
+        memcpy(&offset, bytes + sizeof(header) + 4, sizeof(offset));
+        memcpy(&count, bytes + sizeof(header) + 4 + sizeof(offset), sizeof(count));
+        set(info, "range_offset", ULL2NUM(offset));
+        set(info, "range_count", ULL2NUM(count));
     } else {
         set(info, "raw", rb_str_new((const char *)bytes + sizeof(header), length - sizeof(header)));
     }
     return info;
 }
 
-static VALUE native_parse(VALUE self, VALUE buffer)
+static void prepare_descriptors(struct parse_context *context, const unsigned char *bytes, size_t length)
 {
+    size_t offset = 0;
+
+    while (offset < length) {
+        struct fanotify_event_metadata metadata;
+        size_t info_offset;
+        if (length - offset < sizeof(metadata)) break;
+        memcpy(&metadata, bytes + offset, sizeof(metadata));
+        if (metadata.fd >= 0) tracked_descriptor(context, metadata.fd);
+        if (metadata.metadata_len < sizeof(metadata) || metadata.event_len < metadata.metadata_len ||
+            metadata.event_len > length - offset) break;
+
+        info_offset = offset + metadata.metadata_len;
+        while (info_offset < offset + metadata.event_len) {
+            struct fanotify_event_info_header header;
+            int32_t pidfd;
+            if (offset + metadata.event_len - info_offset < sizeof(header)) break;
+            memcpy(&header, bytes + info_offset, sizeof(header));
+            if (header.len < sizeof(header) || header.len > offset + metadata.event_len - info_offset) break;
+            if (header.info_type == FAN_EVENT_INFO_TYPE_PIDFD && header.len >= sizeof(header) + sizeof(pidfd)) {
+                memcpy(&pidfd, bytes + info_offset + sizeof(header), sizeof(pidfd));
+                if (pidfd >= 0) tracked_descriptor(context, pidfd);
+            }
+            info_offset += header.len;
+        }
+        offset += metadata.event_len;
+    }
+    context->owned_cursor = context->owned_head;
+}
+
+static VALUE parse_buffer(VALUE context_value)
+{
+    struct parse_context *context = (struct parse_context *)context_value;
     const unsigned char *bytes;
     size_t length;
     size_t offset = 0;
     VALUE events = rb_ary_new();
-    (void)self;
 
-    StringValue(buffer);
-    bytes = (const unsigned char *)RSTRING_PTR(buffer);
-    length = (size_t)RSTRING_LEN(buffer);
+    StringValue(context->buffer);
+    bytes = (const unsigned char *)RSTRING_PTR(context->buffer);
+    length = (size_t)RSTRING_LEN(context->buffer);
+    if (context->own_fds) prepare_descriptors(context, bytes, length);
 
     while (offset < length) {
         struct fanotify_event_metadata metadata;
@@ -301,6 +392,8 @@ static VALUE native_parse(VALUE self, VALUE buffer)
         set(event, "fd", INT2NUM(metadata.fd));
         set(event, "pid", INT2NUM(metadata.pid));
         set(event, "infos", infos);
+        if (context->own_fds && metadata.fd >= 0)
+            set(event, "file_descriptor", prepared_descriptor(context, metadata.fd));
 
         info_offset = offset + metadata.metadata_len;
         while (info_offset < offset + metadata.event_len) {
@@ -310,13 +403,34 @@ static VALUE native_parse(VALUE self, VALUE buffer)
             memcpy(&header, bytes + info_offset, sizeof(header));
             if (header.len < sizeof(header) || header.len > offset + metadata.event_len - info_offset)
                 rb_raise(rb_eArgError, "invalid fanotify info length");
-            rb_ary_push(infos, parse_info(bytes + info_offset, header.len));
+            rb_ary_push(infos, parse_info(bytes + info_offset, header.len, context));
             info_offset += header.len;
         }
 
         rb_ary_push(events, event);
         offset += metadata.event_len;
     }
+    return events;
+}
+
+static VALUE native_parse(int argc, VALUE *argv, VALUE self)
+{
+    VALUE own_fds_value;
+    VALUE events;
+    int exception;
+    struct parse_context context = {Qnil, Qnil, 0, NULL, NULL, NULL};
+    (void)self;
+
+    rb_scan_args(argc, argv, "11", &context.buffer, &own_fds_value);
+    context.own_fds = RTEST(own_fds_value);
+    context.descriptor_roots = rb_ary_new();
+    rb_gc_register_address(&context.descriptor_roots);
+    events = rb_protect(parse_buffer, (VALUE)&context, &exception);
+    release_tracked_descriptors(&context, exception);
+    rb_gc_unregister_address(&context.descriptor_roots);
+    if (exception) rb_jump_tag(exception);
+    RB_GC_GUARD(context.buffer);
+    RB_GC_GUARD(context.descriptor_roots);
     return events;
 }
 
@@ -336,7 +450,6 @@ void Init_fanotify(void)
     rb_define_method(cDescriptor, "respond", descriptor_respond, 2);
     rb_define_singleton_method(mNative, "supported?", native_supported_p, 0);
     rb_define_singleton_method(mNative, "open", native_open, 2);
-    rb_define_singleton_method(mNative, "wrap", native_wrap, 1);
-    rb_define_singleton_method(mNative, "parse", native_parse, 1);
+    rb_define_singleton_method(mNative, "parse", native_parse, -1);
     fanotify_define_constants(mNative);
 }

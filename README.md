@@ -55,6 +55,9 @@ end
 values. Handles are comparable and printable as hex, but v1 does not open them with
 `open_by_handle_at(2)`.
 
+Linux 6.14 pre-access events expose the requested byte range as
+`Event#range_offset` and `Event#range_count`; see `examples/lazy_fetch.rb`.
+
 ## Permission decisions
 
 Permission marks require `CAP_SYS_ADMIN`:
@@ -132,6 +135,11 @@ KVER=6.1 tools/vm/run.sh
 
 `bundle exec rake gen:constants` regenerates the Ruby constant bindings. Values are
 still resolved from the target system's UAPI headers at extension build time.
+
+Reference throughput for 10,000 distinct `FAN_OPEN` FID events was 266,374 events/s
+on Ruby 3.4.10, Linux 6.8 arm64 in a Docker Desktop VM. Run
+`bundle exec ruby benchmark/events.rb` on the deployment host; handler work and event
+shape dominate real throughput.
 
 See `examples/` for audit, permission-scan, and experimental pre-access programs.
 

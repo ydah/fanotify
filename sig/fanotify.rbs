@@ -44,12 +44,15 @@ module Fanotify
     attr_reader dfid: FileHandle?
     attr_reader name: String?
     attr_reader pidfd: Integer?
+    attr_reader pidfd_error: Integer?
     attr_reader old_dfid: FileHandle?
     attr_reader old_name: String?
     attr_reader new_dfid: FileHandle?
     attr_reader new_name: String?
     attr_reader error: Integer?
     attr_reader error_count: Integer?
+    attr_reader range_offset: Integer?
+    attr_reader range_count: Integer?
 
     def self.parse: (String buffer, ?notifier: Notifier?, ?own_fds: bool) -> Array[Event]
     def mask: () -> Array[Symbol]

@@ -46,6 +46,7 @@ jobs:
         kernel:
           - v6.1
           - v6.12
+          - v6.14
 
     steps:
       - uses: actions/checkout@v6
@@ -57,6 +58,7 @@ jobs:
           ruby-version: '3.4'
           bundler-cache: true
       - name: Install VM runner
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 virtme-ng
+        run: sudo apt-get update && sudo apt-get install -y busybox-static qemu-system-x86 virtme-ng zstd
       - name: Run privileged tests in kernel VM
+        timeout-minutes: 30
         run: vng -v -r ${{ matrix.kernel }} -- bundle exec rake compile test:system

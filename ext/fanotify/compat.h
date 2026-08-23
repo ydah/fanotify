@@ -212,6 +212,9 @@ struct fanotify_event_info_header { uint8_t info_type; uint8_t pad; uint16_t len
 #ifndef FAN_EVENT_INFO_TYPE_ERROR
 #define FAN_EVENT_INFO_TYPE_ERROR 5
 #endif
+#ifndef FAN_EVENT_INFO_TYPE_RANGE
+#define FAN_EVENT_INFO_TYPE_RANGE 6
+#endif
 #ifndef FAN_EVENT_INFO_TYPE_OLD_DFID_NAME
 #define FAN_EVENT_INFO_TYPE_OLD_DFID_NAME 10
 #endif

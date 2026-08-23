@@ -42,6 +42,17 @@ RSpec.describe "permission event safety" do
     expect(handle).to have_received(:respond).with(37, Fanotify::FAN_DENY)
   end
 
+  it "fails open for unvisited events in a batch when a handler raises" do
+    first = event(notifier:, fd: 40)
+    second = event(notifier:, fd: 41)
+    allow(notifier).to receive(:read_events).and_return([first, second])
+
+    expect { notifier.each_event { raise "handler failed" } }.to raise_error("handler failed")
+    expect(handle).to have_received(:respond).with(40, Fanotify::FAN_ALLOW)
+    expect(handle).to have_received(:respond).with(41, Fanotify::FAN_ALLOW)
+    expect(second).to be_closed
+  end
+
   it "supports explicit audited responses" do
     value = event(notifier:)
 
@@ -74,11 +85,54 @@ RSpec.describe "permission event safety" do
     timed_notifier = Fanotify::Notifier.new(class: :content, response_timeout: 0.01)
     value = event(notifier: timed_notifier)
 
-    value.defer!
     expect do
+      value.defer!
       Timeout.timeout(1) { sleep 0.01 until value.responded? }
     end.to output(/response timeout expired/).to_stderr_from_any_process
     expect(value).to be_responded
+  ensure
+    timed_notifier&.close
+  end
+
+  it "stops the watchdog after the last deferred event is answered" do
+    timed_notifier = Fanotify::Notifier.new(class: :content, response_timeout: 0.01)
+    value = event(notifier: timed_notifier)
+    value.defer!
+    value.allow!
+
+    Timeout.timeout(1) do
+      sleep 0.01 while timed_notifier.instance_variable_get(:@watchdog)&.alive?
+    end
+    expect(timed_notifier.instance_variable_get(:@watchdog)).to be_nil
+  ensure
+    timed_notifier&.close
+  end
+
+  it "allows a deferred event when it is garbage collected" do
+    value = event(notifier:)
+    value.defer!
+    value = nil
+
+    expect { 3.times { GC.start } }.to output(/garbage collected; allowing/).to_stderr_from_any_process
+    expect(handle).to have_received(:respond).with(37, Fanotify::FAN_ALLOW)
+  end
+
+  it "writes exactly one response when watchdog and user race" do
+    timed_notifier = Fanotify::Notifier.new(class: :content, response_timeout: 0.01)
+    allow(timed_notifier).to receive(:warn)
+    values = 50.times.map { |fd| event(notifier: timed_notifier, fd: fd + 100).tap(&:defer!) }
+    responders = values.each_with_index.map do |value, index|
+      Thread.new do
+        sleep(index.even? ? 0.009 : 0.011)
+        value.allow!
+      rescue Fanotify::Error
+        nil
+      end
+    end
+
+    Timeout.timeout(2) { sleep 0.001 until values.all?(&:responded?) }
+    responders.each(&:join)
+    expect(handle).to have_received(:respond).exactly(values.length).times
   ensure
     timed_notifier&.close
   end

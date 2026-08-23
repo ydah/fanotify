@@ -39,6 +39,21 @@ RSpec.describe Fanotify::Event do
     expect(event).to have_attributes(pidfd: 9, error: -5, error_count: 3)
   end
 
+  it "keeps PIDFD creation errors separate from owned descriptors" do
+    pidfd = [described_class::INFO_PIDFD, 0, 8, -2].pack("CCSl")
+    event = described_class.parse(metadata(mask: Fanotify::FAN_OPEN, infos: pidfd), own_fds: true).first
+
+    expect(event).to have_attributes(pidfd: nil, pidfd_error: -2)
+    event.close
+  end
+
+  it "parses pre-access byte ranges" do
+    range = [described_class::INFO_RANGE, 0, 24, 0, 4096, 8192].pack("CCSLQQ")
+    event = described_class.parse(metadata(mask: Fanotify::FAN_PRE_ACCESS, infos: range)).first
+
+    expect(event).to have_attributes(range_offset: 4096, range_count: 8192)
+  end
+
   it "keeps both names from rename records" do
     old_info = fid_info(type: described_class::INFO_OLD_DFID_NAME, name: "old.txt")
     new_info = fid_info(type: described_class::INFO_NEW_DFID_NAME, name: "new.txt")
@@ -59,5 +74,23 @@ RSpec.describe Fanotify::Event do
     bad_info = [described_class::INFO_FID, 0, 4].pack("CCS")
     expect { described_class.parse(metadata(mask: 0, infos: bad_info)) }
       .to raise_error(ArgumentError, /truncated FID/)
+  end
+
+  it "releases every owned descriptor when any record is invalid" do
+    previous_stress = GC.stress
+    pipes = 2.times.map { IO.pipe }
+    fds = pipes.map do |reader, _writer|
+      reader.autoclose = false
+      reader.fileno
+    end
+    buffer = metadata(mask: Fanotify::FAN_OPEN, fd: fds[0], version: 99) +
+             metadata(mask: Fanotify::FAN_OPEN, fd: fds[1])
+    GC.stress = true
+
+    expect { described_class.parse(buffer, own_fds: true) }.to raise_error(ArgumentError, /version/)
+    fds.each { |fd| expect { IO.for_fd(fd, autoclose: false).stat }.to raise_error(Errno::EBADF) }
+  ensure
+    GC.stress = previous_stress
+    pipes&.each { |_reader, writer| writer.close }
   end
 end

@@ -90,10 +90,10 @@ module Fanotify
         raise ArgumentError, "response_timeout must be positive or nil"
       end
 
+      @class = klass.to_sym
       validate_report!
       access_modes = event_flags & %i[rdonly wronly rdwr]
       raise ArgumentError, "event_flags require exactly one access mode" unless access_modes.one?
-      @class = klass.to_sym
       flags = fetch(CLASS_FLAGS, @class, "class") | flags_for(@report, REPORT_FLAGS, "report")
       flags |= FAN_NONBLOCK if nonblock
       flags |= FAN_UNLIMITED_QUEUE if unlimited_queue
@@ -128,33 +128,45 @@ module Fanotify
       buffer = @handle.read(timeout)
       return [] unless buffer
 
-      Event.parse(buffer, notifier: self, own_fds: true).tap do |events|
+      events = Event.parse(buffer, notifier: self, own_fds: true)
+      begin
         events.each do |event|
           next unless event.overflow?
 
           warn "fanotify event queue overflowed; events were lost"
           @on_overflow&.call(event)
         end
+      rescue Exception # SystemExit and Interrupt must not strand permission events.
+        events.each { |event| finish_event(event, :allow, suppress_errors: true) }
+        raise
       end
+      events
     end
 
     def each_event
       return enum_for(__method__) unless block_given?
 
       loop do
-        read_events(timeout: @nonblock ? 0.1 : nil).each do |event|
-          if @exclude_self && event.pid == Process.pid
-            finish_event(event, :allow)
-            next
-          end
-
-          begin
-            yield event
-          ensure
-            handling_error = !$!.nil?
-            if handling_error || !event.deferred?
-              finish_event(event, handling_error ? @on_error : :allow, suppress_errors: handling_error)
+        events = read_events(timeout: @nonblock ? 0.1 : nil)
+        begin
+          events.each do |event|
+            if @exclude_self && event.pid == Process.pid
+              finish_event(event, :allow)
+              next
             end
+
+            begin
+              yield event
+            ensure
+              handling_error = !$!.nil?
+              if handling_error || !event.deferred?
+                finish_event(event, handling_error ? @on_error : :allow, suppress_errors: handling_error)
+              end
+            end
+          end
+        ensure
+          events.each do |event|
+            finish_event(event, :allow, suppress_errors: true) unless event.closed? || event.deferred?
           end
         end
       end
@@ -204,11 +216,11 @@ module Fanotify
       unregister_pending(event)
     end
 
-    def register_pending(event, event_fd)
+    def register_pending(event, event_fd, event_descriptor)
       deadline = monotonic_time + @response_timeout if @response_timeout
       reference = WeakRef.new(event)
       @pending_mutex.synchronize { @pending[event.object_id] = [reference, deadline] }
-      ObjectSpace.define_finalizer(event, deferred_finalizer(event.object_id, event_fd))
+      ObjectSpace.define_finalizer(event, deferred_finalizer(event.object_id, event_fd, event_descriptor))
       start_watchdog if @response_timeout
     end
 
@@ -217,9 +229,15 @@ module Fanotify
       ObjectSpace.undefine_finalizer(event)
     end
 
-    def deferred_finalizer(object_id, event_fd)
+    def deferred_finalizer(object_id, event_fd, event_descriptor)
       notifier = WeakRef.new(self)
-      proc { notifier.__getobj__.__send__(:finalize_deferred, object_id, event_fd) rescue nil }
+      proc do
+        notifier.__getobj__.__send__(:finalize_deferred, object_id, event_fd)
+      rescue WeakRef::RefError
+        nil
+      ensure
+        event_descriptor&.close unless event_descriptor&.closed?
+      end
     end
 
     def finalize_deferred(object_id, event_fd)
@@ -235,7 +253,7 @@ module Fanotify
     def start_watchdog
       return if @watchdog&.alive?
 
-      interval = [@response_timeout / 10.0, 0.1].max
+      interval = [[@response_timeout / 10.0, 0.01].max, 1.0].min
       @watchdog = Thread.new do
         loop do
           sleep interval
@@ -249,6 +267,11 @@ module Fanotify
             warn "fanotify response timeout expired; allowing event"
             finish_event(event, :allow, suppress_errors: true)
           end
+          stop = @pending_mutex.synchronize do
+            @watchdog = nil if @pending.empty?
+            @pending.empty?
+          end
+          break if stop
         end
       end
       @watchdog.name = "fanotify-response-watchdog" if @watchdog.respond_to?(:name=)
@@ -259,6 +282,12 @@ module Fanotify
     def validate_report!
       unknown = @report - REPORT_FLAGS.keys
       raise ArgumentError, "unknown report flags: #{unknown.join(', ')}" unless unknown.empty?
+      if @class != :notif && (@report & %i[fid dir_fid name dfid_name target_fid]).any?
+        raise ArgumentError, "FID reporting requires :notif class"
+      end
+      if (@report & %i[tid pidfd]).length == 2
+        raise ArgumentError, ":tid and :pidfd cannot be combined"
+      end
       raise ArgumentError, ":name requires :dir_fid" if @report.include?(:name) && !@report.include?(:dir_fid)
       return unless @report.include?(:target_fid) && !@report.include?(:dfid_name)
 
@@ -275,6 +304,12 @@ module Fanotify
         raise ArgumentError, "pre_access requires :pre_content class"
       end
       raise ArgumentError, "overflow is receive-only" if mark.events.include?(:overflow)
+      if mark.events.include?(:event_on_child) && mark.on != :inode
+        raise ArgumentError, "event_on_child requires an inode mark"
+      end
+      if mark.events.include?(:fs_error) && (mark.on != :filesystem || !fid_reporting?)
+        raise ArgumentError, "fs_error requires filesystem mark and FID reporting"
+      end
       return if (mark.events & FID_EVENTS).empty? || (@report & %i[fid dir_fid dfid_name]).any?
 
       raise ArgumentError, "#{(mark.events & FID_EVENTS).join(', ')} require FID reporting"
@@ -283,6 +318,8 @@ module Fanotify
     def flags_for(names, mapping, label)
       names.reduce(0) { |flags, name| flags | fetch(mapping, name.to_sym, label) }
     end
+
+    def fid_reporting? = (flags_for(@report, REPORT_FLAGS, "report") & FAN_REPORT_FID).positive?
 
     def fetch(mapping, name, label)
       mapping.fetch(name) { raise ArgumentError, "unknown #{label}: #{name.inspect}" }

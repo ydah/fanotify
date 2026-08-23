@@ -19,8 +19,8 @@ RSpec.describe "fanotify system integration" do
     FileUtils.remove_entry(@directory) if @directory && File.exist?(@directory)
   end
 
-  def permission_notifier(response_timeout: 1.0, on_error: :allow)
-    @notifier = Fanotify::Notifier.new(class: :content, response_timeout:, on_error:)
+  def permission_notifier(response_timeout: 1.0, on_error: :allow, report: [])
+    @notifier = Fanotify::Notifier.new(class: :content, response_timeout:, on_error:, report:)
     @notifier.mark(:add, @directory, events: %i[open_perm event_on_child], only_dir: true)
     @notifier
   rescue Errno::EPERM, Errno::EACCES => error
@@ -64,6 +64,11 @@ RSpec.describe "fanotify system integration" do
     end
   end
 
+  def defer_next_permission_event(notifier)
+    next_permission_event(notifier).defer!
+    nil
+  end
+
   it "receives open notifications" do
     @notifier = Fanotify::Notifier.new(class: :notif, report: [:fid])
     @notifier.mark(:add, @directory, events: %i[open event_on_child], only_dir: true)
@@ -80,6 +85,45 @@ RSpec.describe "fanotify system integration" do
     event.close
   rescue Errno::EPERM, Errno::EACCES => error
     skip "fanotify notification permission denied: #{error.message}"
+  end
+
+  it "releases the GVL and interrupts a blocking read" do
+    reader, writer = IO.pipe
+    pid = fork do
+      reader.close
+      notifier = Fanotify::Notifier.new(class: :notif, report: [:fid])
+      read_thread = Thread.new { notifier.read_events }
+      Thread.pass until read_thread.status == "sleep"
+      read_thread.kill
+      read_thread.join
+      writer.write("gvl:interruptible")
+    ensure
+      notifier&.close
+      writer.close
+      exit!
+    end
+    writer.close
+
+    expect(wait_for_child(pid, reader)).to eq("gvl:interruptible")
+  end
+
+  it "processes an event with GC stress enabled" do
+    previous_stress = GC.stress
+    GC.stress = true
+    @notifier = Fanotify::Notifier.new(class: :notif, report: [:fid])
+    @notifier.mark(:add, @directory, events: %i[open event_on_child], only_dir: true)
+    pid, reader = fork_read
+    event = Timeout.timeout(5) do
+      loop do
+        found = @notifier.read_events(timeout: 1).find { |item| item.mask.include?(:open) }
+        break found if found
+      end
+    end
+
+    event.close
+    expect(wait_for_child(pid, reader)).to eq("ok:payload")
+  ensure
+    GC.stress = previous_stress
   end
 
   it "reports created names through DFID records" do
@@ -99,6 +143,25 @@ RSpec.describe "fanotify system integration" do
     event.close
   rescue Errno::EPERM, Errno::EACCES => error
     skip "fanotify FID permission denied: #{error.message}"
+  end
+
+  it "reports both names and the target FID for renames" do
+    @notifier = Fanotify::Notifier.new(class: :notif, report: %i[dfid_name target_fid])
+    @notifier.mark(:add, @directory, events: %i[rename event_on_child], only_dir: true)
+
+    File.rename(@path, File.join(@directory, "renamed"))
+    event = Timeout.timeout(3) do
+      loop do
+        found = @notifier.read_events(timeout: 1).find { |item| item.mask.include?(:rename) }
+        break found if found
+      end
+    end
+
+    expect(event).to have_attributes(old_name: "payload", new_name: "renamed")
+    expect(event.fid).to be_a(Fanotify::FileHandle)
+    event.close
+  rescue Errno::EINVAL => error
+    skip "FAN_RENAME target FID is unavailable: #{error.message}"
   end
 
   it "creates an unprivileged FID notifier" do
@@ -184,6 +247,50 @@ RSpec.describe "fanotify system integration" do
     expect(wait_for_child(pid, reader)).to eq("error:Errno::EPERM")
   end
 
+  it "owns and closes reported PIDFDs" do
+    notifier = permission_notifier(report: [:pidfd])
+    pid, reader = fork_read
+    event = next_permission_event(notifier)
+
+    expect(event.pidfd).to be_a(Integer)
+    expect(File.readlink("/proc/self/fd/#{event.pidfd}")).to include("pidfd")
+    event.allow!
+    expect(wait_for_child(pid, reader)).to eq("ok:payload")
+    pidfd = event.pidfd
+    event.close
+    expect { IO.for_fd(pidfd, autoclose: false).stat }.to raise_error(Errno::EBADF)
+  end
+
+  it "materializes the requested pre-access range" do
+    @notifier = Fanotify::Notifier.new(
+      class: :pre_content,
+      event_flags: %i[rdwr largefile cloexec],
+      response_timeout: 1.0
+    )
+    @notifier.mark(:add, @path, events: [:pre_access])
+    reader, writer = IO.pipe
+    pid = fork do
+      reader.close
+      writer.write("ok:#{File.open(@path) { |file| file.read(4) }}")
+    rescue StandardError => error
+      writer.write("error:#{error.class.name}")
+    ensure
+      writer.close
+      exit!
+    end
+    writer.close
+    event = next_permission_event(@notifier)
+
+    expect(event).to have_attributes(range_offset: 0, range_count: 4)
+    event.file.write("data")
+    event.file.flush
+    event.allow!
+    expect(wait_for_child(pid, reader)).to eq("ok:data")
+    event.close
+  rescue Errno::EINVAL => error
+    skip "FAN_PRE_ACCESS requires Linux 6.14+: #{error.message}"
+  end
+
   it "automatically allows when a handler returns" do
     notifier = permission_notifier
     pid, reader = fork_read
@@ -210,5 +317,16 @@ RSpec.describe "fanotify system integration" do
 
     expect { expect(wait_for_child(pid, reader)).to eq("ok:payload") }
       .to output(/response timeout expired/).to_stderr_from_any_process
+  end
+
+  it "allows a deferred event when it is garbage collected" do
+    notifier = permission_notifier(response_timeout: nil)
+    pid, reader = fork_read
+    Thread.new { defer_next_permission_event(notifier) }.join
+
+    expect do
+      3.times { GC.start }
+    end.to output(/garbage collected; allowing/).to_stderr_from_any_process
+    expect(wait_for_child(pid, reader)).to eq("ok:payload")
   end
 end

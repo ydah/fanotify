@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 RSpec.describe Fanotify::Notifier do
-  let(:handle) { instance_double(Fanotify::Native::Descriptor, close: nil, closed?: false) }
+  let(:handle) { instance_double(Fanotify::Native::Descriptor, close: nil, closed?: false, read: "buffer") }
 
   before do
     allow(Fanotify::Native).to receive(:open).and_return(handle)
@@ -19,6 +19,8 @@ RSpec.describe Fanotify::Notifier do
   it "validates report flag combinations before opening" do
     expect { described_class.new(report: [:name]) }.to raise_error(ArgumentError, /requires :dir_fid/)
     expect { described_class.new(report: [:target_fid]) }.to raise_error(ArgumentError, /requires :dfid_name/)
+    expect { described_class.new(class: :content, report: [:fid]) }.to raise_error(ArgumentError, /requires :notif/)
+    expect { described_class.new(report: %i[tid pidfd]) }.to raise_error(ArgumentError, /cannot be combined/)
   end
 
   it "requires one event descriptor access mode" do
@@ -42,6 +44,15 @@ RSpec.describe Fanotify::Notifier do
       .to raise_error(ArgumentError, /receive-only/)
   end
 
+  it "validates mark-specific event constraints" do
+    notifier = described_class.new(report: [:fid])
+
+    expect { notifier.mark(:add, "/tmp", events: [:event_on_child], on: :mount) }
+      .to raise_error(ArgumentError, /inode mark/)
+    expect { notifier.mark(:add, "/tmp", events: [:fs_error], on: :inode) }
+      .to raise_error(ArgumentError, /filesystem mark/)
+  end
+
   it "rejects child name events without FID reporting" do
     notifier = described_class.new
 
@@ -55,5 +66,17 @@ RSpec.describe Fanotify::Notifier do
     described_class.new(report: %i[dfid_name target_fid])
 
     expect(Fanotify::Native).to have_received(:open).with(expected, anything)
+  end
+
+  it "closes every parsed event when the overflow callback fails" do
+    regular = instance_double(Fanotify::Event, overflow?: false, close: nil, permission?: false)
+    overflow = instance_double(Fanotify::Event, overflow?: true, close: nil, permission?: false)
+    allow(Fanotify::Event).to receive(:parse).and_return([regular, overflow])
+    notifier = described_class.new(on_overflow: ->(_event) { raise "callback failed" })
+    allow(notifier).to receive(:warn)
+
+    expect { notifier.read_events }.to raise_error("callback failed")
+    expect(regular).to have_received(:close)
+    expect(overflow).to have_received(:close)
   end
 end
