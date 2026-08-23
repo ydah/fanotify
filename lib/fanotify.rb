@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "fanotify/version"
+require "weakref"
 
 module Fanotify
   class Error < StandardError; end

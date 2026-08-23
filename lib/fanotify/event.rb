@@ -24,6 +24,7 @@ module Fanotify
       @pid = attributes[:pid].negative? ? nil : attributes[:pid]
       @notifier = notifier
       @event_fd = attributes[:fd] unless attributes[:fd] == FAN_NOFD
+      @response_mutex = Mutex.new
       @file_descriptor = Native.wrap(@event_fd) if own_fds && @event_fd
       attributes.fetch(:infos).each { |info| apply_info(info, own_fds:) }
     end
@@ -52,14 +53,50 @@ module Fanotify
 
     def deleted? = path&.end_with?(" (deleted)") || false
     def overflow? = (raw_mask & FAN_Q_OVERFLOW).positive?
+    def permission? = (raw_mask & Notifier::PERMISSION_MASK).positive?
+    def responded? = @responded || false
+    def deferred? = @deferred || false
+
+    def allow!(audit: false) = respond!(FAN_ALLOW, audit:)
+    def deny!(audit: false) = respond!(FAN_DENY, audit:)
+
+    def defer!
+      raise Error, "only permission events can be deferred" unless permission?
+      raise Error, "event has already been responded to" if responded?
+      raise Error, "event is not associated with a notifier" unless notifier
+
+      return self if deferred?
+
+      @deferred = true
+      notifier.__send__(:register_pending, self, @event_fd)
+      self
+    end
 
     def close
-      @file_descriptor&.close unless @file_descriptor&.closed?
-      @pidfd_descriptor&.close unless @pidfd_descriptor&.closed?
+      begin
+        allow! if permission? && !responded? && notifier
+      ensure
+        @file_descriptor&.close unless @file_descriptor&.closed?
+        @pidfd_descriptor&.close unless @pidfd_descriptor&.closed?
+      end
       nil
     end
 
     private
+
+    def respond!(response, audit:)
+      raise Error, "not a permission event" unless permission?
+      raise Error, "event is not associated with a notifier" unless notifier
+
+      @response_mutex.synchronize do
+        raise Error, "event has already been responded to" if responded?
+
+        notifier.__send__(:respond_to_event, self, @event_fd, response | (audit ? FAN_AUDIT : 0))
+        @responded = true
+        @deferred = false
+      end
+      self
+    end
 
     def apply_info(info, own_fds:)
       case info.fetch(:type)
