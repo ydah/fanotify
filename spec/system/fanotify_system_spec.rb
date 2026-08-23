@@ -4,6 +4,13 @@ require "fileutils"
 require "timeout"
 require "tmpdir"
 
+if (expected_kernel = ENV["FANOTIFY_EXPECT_KERNEL"]&.delete_prefix("v"))
+  actual_kernel = File.read("/proc/sys/kernel/osrelease").strip
+  unless actual_kernel == expected_kernel || actual_kernel.start_with?("#{expected_kernel}.")
+    raise "expected Linux #{expected_kernel}, booted #{actual_kernel}"
+  end
+end
+
 RSpec.describe "fanotify system integration" do
   before do
     @children = []
@@ -361,7 +368,7 @@ RSpec.describe "fanotify system integration" do
 
     expect do
       3.times { GC.start }
+      expect(wait_for_child(pid, reader)).to eq("ok:payload")
     end.to output(/garbage collected; allowing/).to_stderr_from_any_process
-    expect(wait_for_child(pid, reader)).to eq("ok:payload")
   end
 end

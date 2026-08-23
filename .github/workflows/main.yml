@@ -66,7 +66,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - name: Run privileged tests in kernel VM
         timeout-minutes: 30
-        run: vng -v -r ${{ matrix.kernel }} --user root -- env FANOTIFY_REQUIRE_PRIVILEGED=1 FANOTIFY_REQUIRE_PRE_ACCESS=${{ matrix.kernel == 'v6.14' && '1' || '0' }} bundle exec rake compile test:system
+        run: vng -v -r ${{ matrix.kernel }} --user root -- env FANOTIFY_EXPECT_KERNEL=${{ matrix.kernel }} FANOTIFY_REQUIRE_PRIVILEGED=1 FANOTIFY_REQUIRE_PRE_ACCESS=${{ matrix.kernel == 'v6.14' && '1' || '0' }} bundle exec rake compile test:system
 
   portability:
     strategy:

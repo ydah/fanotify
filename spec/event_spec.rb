@@ -98,6 +98,36 @@ RSpec.describe Fanotify::Event do
     pipes&.each { |_reader, writer| writer.close }
   end
 
+  it "releases transferred descriptors when event construction fails" do
+    pipes = 3.times.map { IO.pipe }
+    readers = pipes.map(&:first)
+    attributes = [
+      {raw_mask: Fanotify::FAN_OPEN, fd: readers[0].fileno, pid: 1, infos: [], file_descriptor: readers[0]},
+      {
+        raw_mask: Fanotify::FAN_OPEN,
+        fd: readers[1].fileno,
+        pid: 2,
+        infos: [{type: described_class::INFO_PIDFD, pidfd: readers[2].fileno,
+                 pidfd_descriptor: readers[2]}],
+        file_descriptor: readers[1]
+      }
+    ]
+    allow(Fanotify::Native).to receive(:parse).and_return(attributes)
+    calls = 0
+    allow(described_class).to receive(:new).and_wrap_original do |method, *arguments, **keywords|
+      calls += 1
+      raise "construction failed" if calls == 2
+
+      method.call(*arguments, **keywords)
+    end
+
+    expect { described_class.__send__(:parse_owned, "", notifier: nil) }
+      .to raise_error("construction failed")
+    expect(readers).to all(be_closed)
+  ensure
+    pipes&.each { |_reader, writer| writer.close }
+  end
+
   it "keeps parser input stable during compacting GC" do
     previous_stress = GC.stress
     previous_auto_compact = GC.auto_compact

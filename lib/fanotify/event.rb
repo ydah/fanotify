@@ -24,7 +24,23 @@ module Fanotify
       private
 
       def parse_owned(buffer, notifier:)
-        Native.parse(buffer, true).map { |attributes| new(attributes, notifier:, own_fds: true) }
+        attributes = Native.parse(buffer, true)
+        events = []
+        attributes.each { |item| events << new(item, notifier:, own_fds: true) }
+        events
+      rescue Exception # Transferred kernel descriptors must not wait for GC on construction failure.
+        events&.each { |event| close_owned(event) }
+        attributes&.each do |item|
+          close_owned(item[:file_descriptor])
+          item.fetch(:infos, []).each { |info| close_owned(info[:pidfd_descriptor]) }
+        end
+        raise
+      end
+
+      def close_owned(resource)
+        resource&.close unless resource&.closed?
+      rescue Exception
+        nil
       end
     end
 
@@ -43,16 +59,20 @@ module Fanotify
     end
 
     def file
-      raise Error, "event is closed" if closed?
+      @response_mutex.synchronize do
+        raise Error, "event is closed" if closed?
 
-      @file ||= @file_descriptor&.to_io&.dup
+        @file ||= @file_descriptor&.to_io&.dup
+      end
     end
 
     def path
-      raise Error, "event is closed" if closed?
-      return unless @event_fd
+      @response_mutex.synchronize do
+        raise Error, "event is closed" if closed?
+        return unless @event_fd
 
-      File.readlink("/proc/self/fd/#{@event_fd}")
+        File.readlink("/proc/self/fd/#{@event_fd}")
+      end
     rescue SystemCallError
       nil
     end
@@ -77,64 +97,75 @@ module Fanotify
 
     def defer!
       raise Error, "only permission events can be deferred" unless permission?
-      raise Error, "event is closed" if closed?
       raise Error, "event is not associated with a notifier" unless notifier
 
       @response_mutex.synchronize do
+        raise Error, "event is closed" if closed?
         raise Error, "event has already been responded to" if responded?
         return self if deferred?
 
-        notifier.__send__(:register_pending, self, @event_fd, @file_descriptor)
-        @deferred = true
+        Thread.handle_interrupt(Exception => :never) do
+          notifier.__send__(:register_pending, self, @event_fd,
+                            [@file_descriptor, @pidfd_descriptor].compact)
+          @deferred = true
+        end
       end
       self
     end
 
     def close
-      return if closed?
+      @response_mutex.synchronize do
+        return if closed?
 
-      begin
-        allow! if permission? && !responded? && notifier
-      ensure
-        active_error = $!
-        close_error = nil
-        if deferred?
-          begin
-            notifier.__send__(:unregister_pending, self)
+        begin
+          respond_without_lock(FAN_ALLOW, audit: false) if permission? && !responded? && notifier
+        ensure
+          active_error = $!
+          close_error = nil
+          if deferred?
+            begin
+              notifier.__send__(:unregister_pending, self)
+            rescue StandardError => error
+              close_error ||= error
+            ensure
+              @deferred = false
+            end
+          end
+          [@file, @file_descriptor, @pidfd_descriptor].each do |resource|
+            resource&.close unless resource&.closed?
           rescue StandardError => error
             close_error ||= error
-          ensure
-            @deferred = false
           end
+          @closed = true
+          raise close_error if !active_error && close_error
         end
-        [@file, @file_descriptor, @pidfd_descriptor].each do |resource|
-          resource&.close unless resource&.closed?
-        rescue StandardError => error
-          close_error ||= error
-        end
-        @closed = true
-        raise close_error if !active_error && close_error
+        nil
       end
-      nil
     end
 
     private
 
     def respond!(response, audit:)
       raise Error, "not a permission event" unless permission?
-      raise Error, "event is closed" if closed?
       raise Error, "event is not associated with a notifier" unless notifier
       raise ArgumentError, "audit must be true or false" unless audit == true || audit == false
 
       @response_mutex.synchronize do
+        raise Error, "event is closed" if closed?
         raise Error, "event has already been responded to" if responded?
 
-        notifier.__send__(:respond_to_event, @event_fd, response | (audit ? FAN_AUDIT : 0))
-        @responded = true
-        @deferred = false
-        notifier.__send__(:unregister_pending, self)
+        respond_without_lock(response, audit:)
       end
       self
+    end
+
+    def respond_without_lock(response, audit:)
+      Thread.handle_interrupt(Exception => :never) do
+        notifier.__send__(:respond_to_event, @event_fd, response | (audit ? FAN_AUDIT : 0))
+        @responded = true
+        notifier.__send__(:unregister_pending, self)
+        @deferred = false
+      end
     end
 
     def apply_info(info, own_fds:)

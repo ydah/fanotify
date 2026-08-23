@@ -112,6 +112,7 @@ module Fanotify
       @pending = {}
       @pending_mutex = Mutex.new
       @response_mutex = Mutex.new
+      @closing = false
       @exclude_self = false
     end
 
@@ -143,7 +144,16 @@ module Fanotify
       buffer = @handle.read(timeout)
       return [] unless buffer
 
-      events = Event.__send__(:parse_owned, buffer, notifier: self)
+      begin
+        events = Event.__send__(:parse_owned, buffer, notifier: self)
+      rescue Exception # Closing the group releases permission events that could not be parsed.
+        begin
+          close
+        rescue Exception
+          nil
+        end
+        raise
+      end
       begin
         events.each do |event|
           next unless event.overflow?
@@ -200,7 +210,7 @@ module Fanotify
 
     def to_io
       @response_mutex.synchronize do
-        raise Error, "notifier is closed" if closed?
+        raise Error, "notifier is closed" if @closing || closed?
 
         @io = @handle.to_io.dup unless @io && !@io.closed?
         @io
@@ -211,25 +221,33 @@ module Fanotify
     def closed? = @handle.closed?
 
     def close
-      return if closed?
+      close_token = Object.new
+      @response_mutex.synchronize do
+        return if @closing || closed?
+
+        @closing = close_token
+      end
 
       if @watchdog && @watchdog != Thread.current
         @watchdog.kill
         @watchdog.join
       end
       pending_events.each { |event| finish_event(event, :allow, suppress_errors: true) }
+      @pending_mutex.synchronize { @pending.keys }.each { |object_id| finalize_deferred(object_id) }
       nil
     ensure
-      active_error = $!
-      close_error = nil
-      @response_mutex.synchronize do
-        [@io, @handle].each do |resource|
-          resource&.close unless resource&.closed?
-        rescue StandardError => error
-          close_error ||= error
+      if @closing.equal?(close_token)
+        active_error = $!
+        close_error = nil
+        @response_mutex.synchronize do
+          [@io, @handle].each do |resource|
+            resource&.close unless resource&.closed?
+          rescue StandardError => error
+            close_error ||= error
+          end
         end
+        raise close_error if !active_error && close_error
       end
-      raise close_error if !active_error && close_error
     end
 
     private
@@ -256,46 +274,45 @@ module Fanotify
       @response_mutex.synchronize { @handle.respond(event_fd, response) }
     end
 
-    def register_pending(event, event_fd, event_descriptor)
+    def register_pending(event, event_fd, descriptors)
       deadline = monotonic_time + @response_timeout if @response_timeout
       reference = WeakRef.new(event)
-      @pending_mutex.synchronize { @pending[event.object_id] = [reference, deadline] }
-      ObjectSpace.define_finalizer(event, deferred_finalizer(event.object_id, event_fd, event_descriptor))
-      start_watchdog if @response_timeout
+      @response_mutex.synchronize do
+        raise Error, "notifier is closed" if @closing || closed?
+
+        @pending_mutex.synchronize do
+          @pending[event.object_id] = [reference, deadline, event_fd, descriptors]
+        end
+      end
+      start_watchdog
     rescue Exception # Interrupt must not leave a permission event tracked but undeferred.
       @pending_mutex.synchronize { @pending.delete(event.object_id) }
-      ObjectSpace.undefine_finalizer(event)
       raise
     end
 
     def unregister_pending(event)
       @pending_mutex.synchronize { @pending.delete(event.object_id) }
-      ObjectSpace.undefine_finalizer(event)
     end
 
-    def deferred_finalizer(object_id, event_fd, event_descriptor)
-      notifier = WeakRef.new(self)
-      proc do
-        notifier.__getobj__.__send__(:finalize_deferred, object_id, event_fd)
-      rescue WeakRef::RefError
-        nil
-      ensure
-        event_descriptor&.close unless event_descriptor&.closed?
-      end
-    end
-
-    def finalize_deferred(object_id, event_fd)
+    def finalize_deferred(object_id)
       entry = @pending_mutex.synchronize { @pending.delete(object_id) }
       return unless entry
 
+      _reference, _deadline, event_fd, descriptors = entry
       @response_mutex.synchronize { @handle.respond(event_fd, FAN_ALLOW) unless closed? }
       safely_warn "fanotify deferred event was garbage collected; allowing it"
-    rescue WeakRef::RefError, IOError, SystemCallError
-      nil
+    rescue IOError, SystemCallError => error
+      safely_warn "fanotify failed to allow garbage-collected event: #{error.message}"
+    ensure
+      descriptors&.each do |descriptor|
+        descriptor.close unless descriptor.closed?
+      rescue StandardError
+        nil
+      end
     end
 
     def start_watchdog
-      interval = [[@response_timeout / 10.0, 0.01].max, 1.0].min
+      interval = @response_timeout ? [[@response_timeout / 10.0, 0.01].max, 1.0].min : 0.1
       @pending_mutex.synchronize do
         return if @watchdog&.alive?
 
@@ -308,9 +325,19 @@ module Fanotify
       loop do
         sleep interval
         now = monotonic_time
-        expired = @pending_mutex.synchronize do
-          @pending.values.filter_map { |reference, deadline| dereference(reference) if deadline <= now }
+        expired, collected = @pending_mutex.synchronize do
+          live = []
+          dead = []
+          @pending.each do |object_id, (reference, deadline, _event_fd, _descriptors)|
+            if (event = dereference(reference))
+              live << event if deadline && deadline <= now
+            else
+              dead << object_id
+            end
+          end
+          [live, dead]
         end
+        collected.each { |object_id| finalize_deferred(object_id) }
         expired.each do |event|
           if finish_event(event, :allow, suppress_errors: true)
             safely_warn "fanotify response timeout expired; allowing event"
@@ -341,14 +368,18 @@ module Fanotify
     def validate_report!
       unknown = @report - REPORT_FLAGS.keys
       raise ArgumentError, "unknown report flags: #{unknown.join(', ')}" unless unknown.empty?
+      flags = flags_for(@report, REPORT_FLAGS, "report")
       if @class != :notif && (@report & %i[fid dir_fid name dfid_name target_fid]).any?
         raise ArgumentError, "FID reporting requires :notif class"
       end
       if (@report & %i[tid pidfd]).length == 2
         raise ArgumentError, ":tid and :pidfd cannot be combined"
       end
-      raise ArgumentError, ":name requires :dir_fid" if @report.include?(:name) && !@report.include?(:dir_fid)
-      return unless @report.include?(:target_fid) && !@report.include?(:dfid_name)
+      if (flags & FAN_REPORT_NAME).positive? && (flags & FAN_REPORT_DIR_FID).zero?
+        raise ArgumentError, ":name requires :dir_fid"
+      end
+      return unless (flags & FAN_REPORT_TARGET_FID).positive? &&
+        (flags & FAN_REPORT_DFID_NAME) != FAN_REPORT_DFID_NAME
 
       raise ArgumentError, ":target_fid requires :dfid_name"
     end

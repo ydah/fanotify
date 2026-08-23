@@ -95,12 +95,21 @@ RSpec.describe Fanotify::Notifier do
     writer&.close unless writer&.closed?
   end
 
+  it "closes once across concurrent callers" do
+    notifier = described_class.new
+
+    20.times.map { Thread.new { notifier.close } }.each(&:join)
+
+    expect(handle).to have_received(:close).once
+  end
+
   it "enables all flags required for target FID reports" do
     expected = Fanotify::FAN_REPORT_DFID_NAME | Fanotify::FAN_REPORT_TARGET_FID | Fanotify::FAN_REPORT_FID
 
     described_class.new(report: %i[dfid_name target_fid])
+    described_class.new(report: %i[dir_fid name target_fid])
 
-    expect(Fanotify::Native).to have_received(:open).with(expected, anything)
+    expect(Fanotify::Native).to have_received(:open).with(expected, anything).twice
   end
 
   it "closes every parsed event when the overflow callback fails" do
@@ -113,5 +122,13 @@ RSpec.describe Fanotify::Notifier do
     expect { notifier.read_events }.to raise_error("callback failed")
     expect(regular).to have_received(:close)
     expect(overflow).to have_received(:close)
+  end
+
+  it "closes the notification group when owned event parsing fails" do
+    allow(Fanotify::Event).to receive(:parse_owned).and_raise(ArgumentError, "invalid metadata")
+    notifier = described_class.new
+
+    expect { notifier.read_events }.to raise_error(ArgumentError, "invalid metadata")
+    expect(handle).to have_received(:close)
   end
 end

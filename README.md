@@ -79,7 +79,8 @@ The default behavior is fail-open:
 - A permission event without `allow!` or `deny!` is allowed after the block.
 - A handler exception allows the event before the same exception is raised again.
 - `defer!` registers an asynchronous decision. The default watchdog allows it after
-  five seconds; `response_timeout: nil` disables the watchdog.
+  five seconds; `response_timeout: nil` disables the deadline, while GC fail-open
+  cleanup remains active.
 - `pending_events` exposes live deferred events.
 - `close` allows an unanswered event before closing its descriptors.
 

@@ -10,5 +10,5 @@ if [ "$major" -gt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -ge 14 ]; }; then
   require_pre_access=1
 fi
 
-exec vng -v -r "v$kver" --user root -- env FANOTIFY_REQUIRE_PRIVILEGED=1 \
+exec vng -v -r "v$kver" --user root -- env FANOTIFY_EXPECT_KERNEL="v$kver" FANOTIFY_REQUIRE_PRIVILEGED=1 \
   FANOTIFY_REQUIRE_PRE_ACCESS="$require_pre_access" bundle exec rake test:system

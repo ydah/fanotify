@@ -89,14 +89,69 @@ RSpec.describe "permission event safety" do
   it "records a sent response before deferred cleanup" do
     value = event(notifier:)
     value.defer!
+    calls = 0
     allow(notifier).to receive(:unregister_pending).and_wrap_original do |method, *arguments|
+      calls += 1
+      raise "cleanup failed" if calls == 1
+
       method.call(*arguments)
-      raise "cleanup failed"
     end
 
     expect { value.allow! }.to raise_error("cleanup failed")
     expect(value).to be_responded
+    expect(value).to be_deferred
     value.close
+    expect(notifier.pending_events).to be_empty
+  end
+
+  it "finishes response state before delivering an asynchronous exception" do
+    value = event(notifier:)
+    entered = Queue.new
+    release = Queue.new
+    result = Queue.new
+    allow(handle).to receive(:respond) do
+      entered << true
+      release.pop
+    end
+    worker = Thread.new do
+      value.allow!
+    rescue Exception => error
+      result << error
+    end
+
+    entered.pop
+    worker.raise(Interrupt)
+    release << true
+    worker.join
+
+    expect(result.pop).to be_a(Interrupt)
+    expect(value).to be_responded
+  end
+
+  it "cannot register a deferred event after notifier close starts" do
+    value = event(notifier:)
+    entered = Queue.new
+    release = Queue.new
+    result = Queue.new
+    allow(notifier).to receive(:register_pending).and_wrap_original do |method, *arguments|
+      entered << true
+      release.pop
+      method.call(*arguments)
+    end
+    worker = Thread.new do
+      value.defer!
+    rescue StandardError => error
+      result << error
+    end
+
+    entered.pop
+    notifier.close
+    release << true
+    worker.join
+
+    expect(result.pop).to be_a(Fanotify::Error)
+    expect(value).not_to be_deferred
+    expect(notifier.pending_events).to be_empty
   end
 
   it "closes every pending event when one response fails" do
@@ -165,15 +220,37 @@ RSpec.describe "permission event safety" do
   end
 
   it "allows a deferred event when it is garbage collected" do
-    value = event(notifier:)
+    event_reader, event_writer = IO.pipe
+    pid_reader, pid_writer = IO.pipe
+    event_fd = event_reader.fileno
+    value = Fanotify::Event.new(
+      {
+        raw_mask: Fanotify::FAN_OPEN_PERM,
+        fd: event_fd,
+        pid: 123,
+        infos: [{type: Fanotify::Event::INFO_PIDFD, pidfd: pid_reader.fileno,
+                 pidfd_descriptor: pid_reader}],
+        file_descriptor: event_reader
+      },
+      notifier:,
+      own_fds: true
+    )
     value.defer!
+    sleep 0.2 # Let the watchdog observe the event while it is still live.
     value = nil
 
-    expect { 3.times { GC.start } }.to output(/garbage collected; allowing/).to_stderr_from_any_process
-    expect(handle).to have_received(:respond).with(37, Fanotify::FAN_ALLOW)
+    expect do
+      3.times { GC.start }
+      Timeout.timeout(1) { sleep 0.01 while notifier.instance_variable_get(:@watchdog)&.alive? }
+    end.to output(/garbage collected; allowing/).to_stderr_from_any_process
+    expect(handle).to have_received(:respond).with(event_fd, Fanotify::FAN_ALLOW)
+    expect([event_reader, pid_reader]).to all(be_closed)
+  ensure
+    event_writer&.close
+    pid_writer&.close
   end
 
-  it "does not remove dead tracking entries before their finalizer runs" do
+  it "does not remove dead tracking entries before watchdog cleanup" do
     object = Object.new
     reference = WeakRef.new(object)
     object = nil
@@ -283,5 +360,14 @@ RSpec.describe "permission event safety" do
     expect(handle).to have_received(:respond).with(37, Fanotify::FAN_ALLOW)
     expect(value).to be_closed
     expect { value.path }.to raise_error(Fanotify::Error, /closed/)
+  end
+
+  it "closes a permission event exactly once across concurrent callers" do
+    value = event(notifier:)
+
+    20.times.map { Thread.new { value.close } }.each(&:join)
+
+    expect(handle).to have_received(:respond).with(37, Fanotify::FAN_ALLOW).once
+    expect(value).to be_closed
   end
 end
