@@ -13,7 +13,7 @@ module Fanotify
     dir_fid: FAN_REPORT_DIR_FID,
     name: FAN_REPORT_NAME,
     dfid_name: FAN_REPORT_DFID_NAME,
-    target_fid: FAN_REPORT_TARGET_FID,
+    target_fid: FAN_REPORT_TARGET_FID | FAN_REPORT_FID,
     pidfd: FAN_REPORT_PIDFD
   }.freeze
 
@@ -126,7 +126,12 @@ module Fanotify
       return [] unless buffer
 
       Event.parse(buffer, notifier: self, own_fds: true).tap do |events|
-        events.each { |event| @on_overflow&.call(event) if event.overflow? }
+        events.each do |event|
+          next unless event.overflow?
+
+          warn "fanotify event queue overflowed; events were lost"
+          @on_overflow&.call(event)
+        end
       end
     end
 

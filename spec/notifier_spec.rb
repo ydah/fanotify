@@ -34,4 +34,12 @@ RSpec.describe Fanotify::Notifier do
     expect { notifier.mark(:add, "/tmp", events: [:create]) }
       .to raise_error(ArgumentError, /require FID reporting/)
   end
+
+  it "enables all flags required for target FID reports" do
+    expected = Fanotify::FAN_REPORT_DFID_NAME | Fanotify::FAN_REPORT_TARGET_FID | Fanotify::FAN_REPORT_FID
+
+    described_class.new(report: %i[dfid_name target_fid])
+
+    expect(Fanotify::Native).to have_received(:open).with(expected, anything)
+  end
 end

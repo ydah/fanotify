@@ -39,6 +39,15 @@ RSpec.describe Fanotify::Event do
     expect(event).to have_attributes(pidfd: 9, error: -5, error_count: 3)
   end
 
+  it "keeps both names from rename records" do
+    old_info = fid_info(type: described_class::INFO_OLD_DFID_NAME, name: "old.txt")
+    new_info = fid_info(type: described_class::INFO_NEW_DFID_NAME, name: "new.txt")
+    event = described_class.parse(metadata(mask: Fanotify::FAN_RENAME, infos: old_info + new_info)).first
+
+    expect(event).to have_attributes(old_name: "old.txt", new_name: "new.txt")
+    expect(event.old_dfid).to eq(event.new_dfid)
+  end
+
   it "rejects malformed kernel records" do
     expect { described_class.parse("short") }.to raise_error(ArgumentError, /truncated fanotify metadata/)
     expect { described_class.parse(metadata(mask: 0, version: 99)) }.to raise_error(ArgumentError, /version/)

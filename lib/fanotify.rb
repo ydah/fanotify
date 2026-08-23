@@ -27,7 +27,7 @@ module Fanotify
     def watch(path, events: %i[create delete modify], **options, &block)
       return enum_for(__method__, path, events:, **options) unless block
 
-      options = {class: :notif, report: [:dfid_name]}.merge(options)
+      options = {class: :notif, report: %i[fid dfid_name]}.merge(options)
       Notifier.open(**options) do |notifier|
         notifier.mark(:add, path, events: events + [:event_on_child], only_dir: true)
         notifier.each_event(&block)
