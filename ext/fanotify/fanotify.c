@@ -22,6 +22,8 @@ struct owned_fd {
 struct parse_context {
     VALUE buffer;
     VALUE descriptor_roots;
+    unsigned char *bytes;
+    size_t length;
     int own_fds;
     struct owned_fd *owned_head;
     struct owned_fd *owned_tail;
@@ -175,30 +177,40 @@ static void *read_without_gvl(void *pointer)
     return NULL;
 }
 
+static VALUE perform_read(VALUE pointer)
+{
+    struct read_args *args = (struct read_args *)pointer;
+
+    rb_thread_call_without_gvl(read_without_gvl, args, RUBY_UBF_IO, NULL);
+    if (args->result < 0 && (args->error == EAGAIN || args->error == EWOULDBLOCK)) {
+        return Qnil;
+    }
+    if (args->result < 0) {
+        rb_syserr_fail(args->error, "read(fanotify)");
+    }
+    if (args->result == 0) {
+        return Qnil;
+    }
+    return rb_str_new(args->buffer, args->result);
+}
+
+static VALUE free_read_buffer(VALUE pointer)
+{
+    struct read_args *args = (struct read_args *)pointer;
+    xfree(args->buffer);
+    return Qnil;
+}
+
 static VALUE descriptor_read(VALUE self, VALUE timeout)
 {
     descriptor_t *descriptor = get_descriptor(self);
     struct read_args args;
-    VALUE result = rb_str_new(NULL, READ_BUFFER_SIZE);
 
     args.fd = descriptor->fd;
     args.timeout_ms = NIL_P(timeout) ? -1 : NUM2INT(rb_funcall(timeout, rb_intern("*"), 1, INT2NUM(1000)));
     if (args.timeout_ms < -1) rb_raise(rb_eArgError, "timeout must be non-negative");
-    args.buffer = RSTRING_PTR(result);
-
-    rb_thread_call_without_gvl(read_without_gvl, &args, RUBY_UBF_IO, NULL);
-    if (args.result < 0 && (args.error == EAGAIN || args.error == EWOULDBLOCK)) {
-        return Qnil;
-    }
-    if (args.result < 0) {
-        rb_syserr_fail(args.error, "read(fanotify)");
-    }
-    if (args.result == 0) {
-        return Qnil;
-    }
-
-    rb_str_set_len(result, args.result);
-    return result;
+    args.buffer = ALLOC_N(char, READ_BUFFER_SIZE);
+    return rb_ensure(perform_read, (VALUE)&args, free_read_buffer, (VALUE)&args);
 }
 
 static VALUE descriptor_mark(VALUE self, VALUE flags, VALUE mask, VALUE dirfd, VALUE path)
@@ -219,7 +231,10 @@ static VALUE descriptor_respond(VALUE self, VALUE event_fd, VALUE response)
 {
     descriptor_t *descriptor = get_descriptor(self);
     struct fanotify_response value = {NUM2INT(event_fd), NUM2UINT(response)};
-    ssize_t written = write(descriptor->fd, &value, sizeof(value));
+    ssize_t written;
+    do {
+        written = write(descriptor->fd, &value, sizeof(value));
+    } while (written < 0 && errno == EINTR);
     if (written < 0) rb_sys_fail("write(fanotify response)");
     if ((size_t)written != sizeof(value)) rb_raise(rb_eIOError, "short fanotify response write");
     return Qnil;
@@ -363,14 +378,11 @@ static void prepare_descriptors(struct parse_context *context, const unsigned ch
 static VALUE parse_buffer(VALUE context_value)
 {
     struct parse_context *context = (struct parse_context *)context_value;
-    const unsigned char *bytes;
-    size_t length;
+    const unsigned char *bytes = context->bytes;
+    size_t length = context->length;
     size_t offset = 0;
     VALUE events = rb_ary_new();
 
-    StringValue(context->buffer);
-    bytes = (const unsigned char *)RSTRING_PTR(context->buffer);
-    length = (size_t)RSTRING_LEN(context->buffer);
     if (context->own_fds) prepare_descriptors(context, bytes, length);
 
     while (offset < length) {
@@ -418,16 +430,21 @@ static VALUE native_parse(int argc, VALUE *argv, VALUE self)
     VALUE own_fds_value;
     VALUE events;
     int exception;
-    struct parse_context context = {Qnil, Qnil, 0, NULL, NULL, NULL};
+    struct parse_context context = {Qnil, Qnil, NULL, 0, 0, NULL, NULL, NULL};
     (void)self;
 
     rb_scan_args(argc, argv, "11", &context.buffer, &own_fds_value);
-    context.own_fds = RTEST(own_fds_value);
+    StringValue(context.buffer);
+    context.length = (size_t)RSTRING_LEN(context.buffer);
     context.descriptor_roots = rb_ary_new();
+    context.bytes = ALLOC_N(unsigned char, context.length ? context.length : 1);
+    memcpy(context.bytes, RSTRING_PTR(context.buffer), context.length);
+    context.own_fds = RTEST(own_fds_value);
     rb_gc_register_address(&context.descriptor_roots);
     events = rb_protect(parse_buffer, (VALUE)&context, &exception);
     release_tracked_descriptors(&context, exception);
     rb_gc_unregister_address(&context.descriptor_roots);
+    xfree(context.bytes);
     if (exception) rb_jump_tag(exception);
     RB_GC_GUARD(context.buffer);
     RB_GC_GUARD(context.descriptor_roots);

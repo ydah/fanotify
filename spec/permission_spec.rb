@@ -71,6 +71,48 @@ RSpec.describe "permission event safety" do
     expect(notifier.pending_events).to be_empty
   end
 
+  it "fails open when deferred registration raises" do
+    timed_notifier = Fanotify::Notifier.new(class: :content, response_timeout: 1)
+    value = event(notifier: timed_notifier)
+    one_event_then_stop(timed_notifier, value)
+    allow(timed_notifier).to receive(:start_watchdog).and_raise(ThreadError, "cannot start watchdog")
+
+    expect { timed_notifier.each_event { |received| received.defer! } }.to raise_error(ThreadError)
+    expect(handle).to have_received(:respond).with(37, Fanotify::FAN_ALLOW)
+    expect(value).to be_closed
+    expect(timed_notifier.pending_events).to be_empty
+  ensure
+    timed_notifier&.close
+  end
+
+  it "records a sent response before deferred cleanup" do
+    value = event(notifier:)
+    value.defer!
+    allow(notifier).to receive(:unregister_pending).and_wrap_original do |method, *arguments|
+      method.call(*arguments)
+      raise "cleanup failed"
+    end
+
+    expect { value.allow! }.to raise_error("cleanup failed")
+    expect(value).to be_responded
+    value.close
+  end
+
+  it "closes every pending event when one response fails" do
+    values = [event(notifier:, fd: 50), event(notifier:, fd: 51)]
+    values.each(&:defer!)
+    calls = 0
+    allow(handle).to receive(:respond) do
+      calls += 1
+      raise IOError, "response failed" if calls <= 2
+    end
+    allow(notifier).to receive(:warn)
+
+    notifier.close
+    expect(values).to all(be_closed)
+    expect(handle).to have_received(:respond).exactly(3).times
+  end
+
   it "answers a deferred event before propagating a handler error" do
     value = event(notifier:)
     one_event_then_stop(notifier, value)
@@ -88,7 +130,20 @@ RSpec.describe "permission event safety" do
     expect do
       value.defer!
       Timeout.timeout(1) { sleep 0.01 until value.responded? }
+      Timeout.timeout(1) { sleep 0.01 while timed_notifier.instance_variable_get(:@watchdog)&.alive? }
     end.to output(/response timeout expired/).to_stderr_from_any_process
+    expect(value).to be_responded
+  ensure
+    timed_notifier&.close
+  end
+
+  it "answers timed out events even when warning output raises" do
+    timed_notifier = Fanotify::Notifier.new(class: :content, response_timeout: 0.01)
+    allow(timed_notifier).to receive(:warn).and_raise(IOError, "stderr failed")
+    value = event(notifier: timed_notifier)
+
+    value.defer!
+    Timeout.timeout(1) { sleep 0.01 until value.responded? }
     expect(value).to be_responded
   ensure
     timed_notifier&.close
@@ -117,6 +172,20 @@ RSpec.describe "permission event safety" do
     expect(handle).to have_received(:respond).with(37, Fanotify::FAN_ALLOW)
   end
 
+  it "does not remove dead tracking entries before their finalizer runs" do
+    object = Object.new
+    reference = WeakRef.new(object)
+    object = nil
+    GC.start
+    pending = notifier.instance_variable_get(:@pending)
+    pending[123] = [reference, nil]
+
+    expect(notifier.pending_events).to be_empty
+    expect(pending).to have_key(123)
+  ensure
+    pending&.delete(123)
+  end
+
   it "writes exactly one response when watchdog and user race" do
     timed_notifier = Fanotify::Notifier.new(class: :content, response_timeout: 0.01)
     allow(timed_notifier).to receive(:warn)
@@ -133,6 +202,52 @@ RSpec.describe "permission event safety" do
     Timeout.timeout(2) { sleep 0.001 until values.all?(&:responded?) }
     responders.each(&:join)
     expect(handle).to have_received(:respond).exactly(values.length).times
+  ensure
+    timed_notifier&.close
+  end
+
+  it "does not re-defer an event while it is being answered" do
+    value = event(notifier:)
+    entered = Queue.new
+    answer_started = Queue.new
+    release = Queue.new
+    order = Queue.new
+    allow(notifier).to receive(:register_pending).and_wrap_original do |method, *arguments|
+      entered << true
+      release.pop
+      method.call(*arguments)
+    end
+    allow(handle).to receive(:respond) { order << :respond }
+
+    defer_thread = Thread.new { value.defer! }
+    entered.pop
+    answer_thread = Thread.new do
+      answer_started << true
+      value.allow!
+    end
+    answer_started.pop
+    Timeout.timeout(1) { Thread.pass until answer_thread.stop? || !answer_thread.alive? }
+    order << :release
+    release << true
+    [defer_thread, answer_thread].each(&:join)
+
+    expect([order.pop, order.pop]).to eq(%i[release respond])
+    expect(value).to be_responded
+    expect(value).not_to be_deferred
+    expect(notifier.pending_events).to be_empty
+  end
+
+  it "starts one watchdog for concurrent deferred events" do
+    timed_notifier = Fanotify::Notifier.new(class: :content, response_timeout: 1)
+    values = 20.times.map { |fd| event(notifier: timed_notifier, fd: fd + 200) }
+    gate = Queue.new
+    allow(Thread).to receive(:new).and_call_original
+    threads = values.map { |value| Thread.new { gate.pop && value.defer! } }
+    values.length.times { gate << true }
+    threads.each(&:join)
+
+    expect(Thread).to have_received(:new).exactly(values.length + 1).times
+    values.each(&:allow!)
   ensure
     timed_notifier&.close
   end

@@ -82,11 +82,20 @@ module Fanotify
       audit = options.delete(:audit) || false
       event_flags = Array(options.delete(:event_flags) || %i[rdonly largefile cloexec]).map(&:to_sym)
       @on_overflow = options.delete(:on_overflow)
-      @on_error = (options.delete(:on_error) || :allow).to_sym
+      @on_error = options.delete(:on_error)
+      @on_error = @on_error.nil? ? :allow : @on_error
+      @on_error = @on_error.to_sym if @on_error.respond_to?(:to_sym)
       @response_timeout = options.key?(:response_timeout) ? options.delete(:response_timeout) : 5.0
       raise ArgumentError, "unknown options: #{options.keys.join(', ')}" unless options.empty?
+      unless [nonblock, unlimited_queue, unlimited_marks, audit].all? { |value| value == true || value == false }
+        raise ArgumentError, "boolean options must be true or false"
+      end
+      if @on_overflow && !@on_overflow.respond_to?(:call)
+        raise ArgumentError, "on_overflow must be callable or nil"
+      end
       raise ArgumentError, "on_error must be :allow or :deny" unless %i[allow deny].include?(@on_error)
-      if @response_timeout && !@response_timeout.positive?
+      unless @response_timeout.nil? || (@response_timeout.is_a?(Numeric) && @response_timeout.real? &&
+        @response_timeout.finite? && @response_timeout.positive?)
         raise ArgumentError, "response_timeout must be positive or nil"
       end
 
@@ -123,17 +132,20 @@ module Fanotify
     end
 
     def read_events(timeout: nil)
-      raise ArgumentError, "timeout must be non-negative" if timeout&.negative?
+      unless timeout.nil? || (timeout.is_a?(Numeric) && timeout.real? && timeout.finite? &&
+        timeout >= 0 && timeout * 1000 <= 2_147_483_647)
+        raise ArgumentError, "timeout must be a non-negative finite number or nil"
+      end
 
       buffer = @handle.read(timeout)
       return [] unless buffer
 
-      events = Event.parse(buffer, notifier: self, own_fds: true)
+      events = Event.__send__(:parse_owned, buffer, notifier: self)
       begin
         events.each do |event|
           next unless event.overflow?
 
-          warn "fanotify event queue overflowed; events were lost"
+          safely_warn "fanotify event queue overflowed; events were lost"
           @on_overflow&.call(event)
         end
       rescue Exception # SystemExit and Interrupt must not strand permission events.
@@ -179,7 +191,6 @@ module Fanotify
 
     def pending_events
       @pending_mutex.synchronize do
-        @pending.delete_if { |_id, (reference, _deadline)| !reference.weakref_alive? }
         @pending.values.filter_map do |reference, _deadline|
           reference.__getobj__ if reference.weakref_alive?
         end
@@ -195,7 +206,7 @@ module Fanotify
 
       @watchdog&.kill
       @watchdog&.join
-      pending_events.each { |event| finish_event(event, :allow) }
+      pending_events.each { |event| finish_event(event, :allow, suppress_errors: true) }
     ensure
       @handle.close unless @handle.closed?
     end
@@ -203,17 +214,25 @@ module Fanotify
     private
 
     def finish_event(event, decision, suppress_errors: false)
-      event.public_send("#{decision}!") if event.permission? && !event.responded?
-      event.close
+      responded = false
+      begin
+        if event.permission? && !event.responded?
+          event.public_send("#{decision}!")
+          responded = true
+        end
+      ensure
+        event.close
+      end
+      responded
     rescue StandardError => response_error
       raise unless suppress_errors
 
-      warn "fanotify failed to #{decision} event: #{response_error.message}"
+      safely_warn "fanotify failed to #{decision} event: #{response_error.message}"
+      false
     end
 
-    def respond_to_event(event, event_fd, response)
+    def respond_to_event(event_fd, response)
       @response_mutex.synchronize { @handle.respond(event_fd, response) }
-      unregister_pending(event)
     end
 
     def register_pending(event, event_fd, event_descriptor)
@@ -222,6 +241,10 @@ module Fanotify
       @pending_mutex.synchronize { @pending[event.object_id] = [reference, deadline] }
       ObjectSpace.define_finalizer(event, deferred_finalizer(event.object_id, event_fd, event_descriptor))
       start_watchdog if @response_timeout
+    rescue Exception # Interrupt must not leave a permission event tracked but undeferred.
+      @pending_mutex.synchronize { @pending.delete(event.object_id) }
+      ObjectSpace.undefine_finalizer(event)
+      raise
     end
 
     def unregister_pending(event)
@@ -244,40 +267,51 @@ module Fanotify
       entry = @pending_mutex.synchronize { @pending.delete(object_id) }
       return unless entry
 
-      warn "fanotify deferred event was garbage collected; allowing it"
       @response_mutex.synchronize { @handle.respond(event_fd, FAN_ALLOW) unless closed? }
+      safely_warn "fanotify deferred event was garbage collected; allowing it"
     rescue WeakRef::RefError, IOError, SystemCallError
       nil
     end
 
     def start_watchdog
-      return if @watchdog&.alive?
-
       interval = [[@response_timeout / 10.0, 0.01].max, 1.0].min
-      @watchdog = Thread.new do
-        loop do
-          sleep interval
-          now = monotonic_time
-          expired = @pending_mutex.synchronize do
-            @pending.values.filter_map do |reference, deadline|
-              reference.__getobj__ if deadline <= now && reference.weakref_alive?
-            end
-          end
-          expired.each do |event|
-            warn "fanotify response timeout expired; allowing event"
-            finish_event(event, :allow, suppress_errors: true)
-          end
-          stop = @pending_mutex.synchronize do
-            @watchdog = nil if @pending.empty?
-            @pending.empty?
-          end
-          break if stop
-        end
+      @pending_mutex.synchronize do
+        return if @watchdog&.alive?
+
+        @watchdog = Thread.new { watchdog_loop(interval) }
+        @watchdog.name = "fanotify-response-watchdog" if @watchdog.respond_to?(:name=)
       end
-      @watchdog.name = "fanotify-response-watchdog" if @watchdog.respond_to?(:name=)
+    end
+
+    def watchdog_loop(interval)
+      loop do
+        sleep interval
+        now = monotonic_time
+        expired = @pending_mutex.synchronize do
+          @pending.values.filter_map do |reference, deadline|
+            reference.__getobj__ if deadline <= now && reference.weakref_alive?
+          end
+        end
+        expired.each do |event|
+          if finish_event(event, :allow, suppress_errors: true)
+            safely_warn "fanotify response timeout expired; allowing event"
+          end
+        end
+        stop = @pending_mutex.synchronize do
+          @watchdog = nil if @pending.empty?
+          @pending.empty?
+        end
+        break if stop
+      end
     end
 
     def monotonic_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    def safely_warn(message)
+      warn message
+    rescue StandardError
+      nil
+    end
 
     def validate_report!
       unknown = @report - REPORT_FLAGS.keys

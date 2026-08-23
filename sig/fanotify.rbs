@@ -54,7 +54,7 @@ module Fanotify
     attr_reader range_offset: Integer?
     attr_reader range_count: Integer?
 
-    def self.parse: (String buffer, ?notifier: Notifier?, ?own_fds: bool) -> Array[Event]
+    def self.parse: (String buffer) -> Array[Event]
     def mask: () -> Array[Symbol]
     def file: () -> IO?
     def path: () -> String?

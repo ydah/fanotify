@@ -17,8 +17,14 @@ module Fanotify
                 :error, :error_count, :range_offset, :range_count
 
     class << self
-      def parse(buffer, notifier: nil, own_fds: false)
-        Native.parse(buffer, own_fds).map { |attributes| new(attributes, notifier:, own_fds:) }
+      def parse(buffer)
+        Native.parse(buffer).map { |attributes| new(attributes) }
+      end
+
+      private
+
+      def parse_owned(buffer, notifier:)
+        Native.parse(buffer, true).map { |attributes| new(attributes, notifier:, own_fds: true) }
       end
     end
 
@@ -39,7 +45,7 @@ module Fanotify
     def file
       raise Error, "event is closed" if closed?
 
-      @file_descriptor&.to_io
+      @file ||= @file_descriptor&.to_io&.dup
     end
 
     def path
@@ -71,13 +77,16 @@ module Fanotify
 
     def defer!
       raise Error, "only permission events can be deferred" unless permission?
-      raise Error, "event has already been responded to" if responded?
+      raise Error, "event is closed" if closed?
       raise Error, "event is not associated with a notifier" unless notifier
 
-      return self if deferred?
+      @response_mutex.synchronize do
+        raise Error, "event has already been responded to" if responded?
+        return self if deferred?
 
-      @deferred = true
-      notifier.__send__(:register_pending, self, @event_fd, @file_descriptor)
+        notifier.__send__(:register_pending, self, @event_fd, @file_descriptor)
+        @deferred = true
+      end
       self
     end
 
@@ -87,9 +96,24 @@ module Fanotify
       begin
         allow! if permission? && !responded? && notifier
       ensure
-        @file_descriptor&.close unless @file_descriptor&.closed?
-        @pidfd_descriptor&.close unless @pidfd_descriptor&.closed?
+        active_error = $!
+        close_error = nil
+        if deferred?
+          begin
+            notifier.__send__(:unregister_pending, self)
+          rescue StandardError => error
+            close_error ||= error
+          ensure
+            @deferred = false
+          end
+        end
+        [@file, @file_descriptor, @pidfd_descriptor].each do |resource|
+          resource&.close unless resource&.closed?
+        rescue StandardError => error
+          close_error ||= error
+        end
         @closed = true
+        raise close_error if !active_error && close_error
       end
       nil
     end
@@ -98,14 +122,16 @@ module Fanotify
 
     def respond!(response, audit:)
       raise Error, "not a permission event" unless permission?
+      raise Error, "event is closed" if closed?
       raise Error, "event is not associated with a notifier" unless notifier
 
       @response_mutex.synchronize do
         raise Error, "event has already been responded to" if responded?
 
-        notifier.__send__(:respond_to_event, self, @event_fd, response | (audit ? FAN_AUDIT : 0))
+        notifier.__send__(:respond_to_event, @event_fd, response | (audit ? FAN_AUDIT : 0))
         @responded = true
         @deferred = false
+        notifier.__send__(:unregister_pending, self)
       end
       self
     end

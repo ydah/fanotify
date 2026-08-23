@@ -41,7 +41,9 @@ RSpec.describe Fanotify::Event do
 
   it "keeps PIDFD creation errors separate from owned descriptors" do
     pidfd = [described_class::INFO_PIDFD, 0, 8, -2].pack("CCSl")
-    event = described_class.parse(metadata(mask: Fanotify::FAN_OPEN, infos: pidfd), own_fds: true).first
+    event = described_class.__send__(
+      :parse_owned, metadata(mask: Fanotify::FAN_OPEN, infos: pidfd), notifier: nil
+    ).first
 
     expect(event).to have_attributes(pidfd: nil, pidfd_error: -2)
     event.close
@@ -68,6 +70,7 @@ RSpec.describe Fanotify::Event do
     expect { described_class.parse(metadata(mask: 0, version: 99)) }.to raise_error(ArgumentError, /version/)
     expect { described_class.parse(metadata(mask: 0, event_len: 0)) }.to raise_error(ArgumentError, /event length/)
     expect { described_class.parse(metadata(mask: 0, event_len: 48)) }.to raise_error(ArgumentError, /truncated fanotify event/)
+    expect { described_class.parse(metadata(mask: 0), own_fds: true) }.to raise_error(ArgumentError, /argument|keyword/)
   end
 
   it "rejects malformed info records" do
@@ -87,10 +90,43 @@ RSpec.describe Fanotify::Event do
              metadata(mask: Fanotify::FAN_OPEN, fd: fds[1])
     GC.stress = true
 
-    expect { described_class.parse(buffer, own_fds: true) }.to raise_error(ArgumentError, /version/)
+    expect { described_class.__send__(:parse_owned, buffer, notifier: nil) }
+      .to raise_error(ArgumentError, /version/)
     fds.each { |fd| expect { IO.for_fd(fd, autoclose: false).stat }.to raise_error(Errno::EBADF) }
   ensure
     GC.stress = previous_stress
     pipes&.each { |_reader, writer| writer.close }
+  end
+
+  it "keeps parser input stable during compacting GC" do
+    previous_stress = GC.stress
+    previous_auto_compact = GC.auto_compact
+    GC.stress = true
+    GC.auto_compact = true
+
+    10.times do
+      event = described_class.parse(metadata(mask: Fanotify::FAN_OPEN, pid: 7)).first
+      expect(event.pid).to eq(7)
+    end
+  ensure
+    GC.stress = previous_stress
+    GC.auto_compact = previous_auto_compact
+  end
+
+  it "invalidates the duplicated file IO when the event closes" do
+    reader, writer = IO.pipe
+    fd = reader.fileno
+    reader.autoclose = false
+    event = described_class.__send__(
+      :parse_owned, metadata(mask: Fanotify::FAN_OPEN, fd:), notifier: nil
+    ).first
+    file = event.file
+
+    expect(file.fileno).not_to eq(fd)
+    event.close
+    expect(file).to be_closed
+    expect { IO.for_fd(fd, autoclose: false).stat }.to raise_error(Errno::EBADF)
+  ensure
+    writer&.close
   end
 end

@@ -93,8 +93,8 @@ opt-in because application bugs then deny access.
 - `exclude_self!` filters self-generated events already read by the notifier. It cannot
   rescue a handler that blocks itself while opening another marked file on the same
   thread.
-- Inspect `event.file`, which refers to the kernel-opened descriptor. Do not reopen
-  `event.path` for a security decision.
+- Inspect `event.file`, which duplicates the kernel-opened descriptor and is closed
+  with the event. Do not reopen `event.path` for a security decision.
 - `event.path` comes from `/proc/self/fd/N` and is informational. Reopening it has a
   TOCTOU race. Deleted paths retain the kernel's `" (deleted)"` suffix.
 - Keep handlers bounded. The kernel has no response timeout; the gem watchdog covers

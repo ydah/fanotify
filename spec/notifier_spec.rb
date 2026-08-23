@@ -28,6 +28,19 @@ RSpec.describe Fanotify::Notifier do
     expect { described_class.new(event_flags: %i[wronly rdwr]) }.to raise_error(ArgumentError, /one access mode/)
   end
 
+  it "rejects ambiguous booleans, callbacks, and durations" do
+    expect { described_class.new(nonblock: "yes") }.to raise_error(ArgumentError, /boolean/)
+    expect { described_class.new(on_overflow: Object.new) }.to raise_error(ArgumentError, /callable/)
+    expect { described_class.new(on_error: false) }.to raise_error(ArgumentError, /on_error/)
+    expect { described_class.new(response_timeout: false) }.to raise_error(ArgumentError, /positive or nil/)
+    expect { described_class.new(response_timeout: Float::INFINITY) }.to raise_error(ArgumentError, /positive or nil/)
+
+    notifier = described_class.new
+    expect { notifier.read_events(timeout: "1") }.to raise_error(ArgumentError, /finite number/)
+    expect { notifier.read_events(timeout: Float::INFINITY) }.to raise_error(ArgumentError, /finite number/)
+    expect { notifier.read_events(timeout: 2_147_484) }.to raise_error(ArgumentError, /finite number/)
+  end
+
   it "rejects permission events for notification class" do
     notifier = described_class.new
 
@@ -71,7 +84,7 @@ RSpec.describe Fanotify::Notifier do
   it "closes every parsed event when the overflow callback fails" do
     regular = instance_double(Fanotify::Event, overflow?: false, close: nil, permission?: false)
     overflow = instance_double(Fanotify::Event, overflow?: true, close: nil, permission?: false)
-    allow(Fanotify::Event).to receive(:parse).and_return([regular, overflow])
+    allow(Fanotify::Event).to receive(:parse_owned).and_return([regular, overflow])
     notifier = described_class.new(on_overflow: ->(_event) { raise "callback failed" })
     allow(notifier).to receive(:warn)
 

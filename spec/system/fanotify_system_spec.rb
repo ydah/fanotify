@@ -254,10 +254,13 @@ RSpec.describe "fanotify system integration" do
 
     expect(event.pidfd).to be_a(Integer)
     expect(File.readlink("/proc/self/fd/#{event.pidfd}")).to include("pidfd")
+    file = event.file
+    expect(file.read).to eq("payload")
     event.allow!
     expect(wait_for_child(pid, reader)).to eq("ok:payload")
     pidfd = event.pidfd
     event.close
+    expect(file).to be_closed
     expect { IO.for_fd(pidfd, autoclose: false).stat }.to raise_error(Errno::EBADF)
   end
 
@@ -315,8 +318,10 @@ RSpec.describe "fanotify system integration" do
     pid, reader = fork_read
     next_permission_event(notifier).defer!
 
-    expect { expect(wait_for_child(pid, reader)).to eq("ok:payload") }
-      .to output(/response timeout expired/).to_stderr_from_any_process
+    expect do
+      expect(wait_for_child(pid, reader)).to eq("ok:payload")
+      Timeout.timeout(1) { sleep 0.01 while notifier.instance_variable_get(:@watchdog)&.alive? }
+    end.to output(/response timeout expired/).to_stderr_from_any_process
   end
 
   it "allows a deferred event when it is garbage collected" do
