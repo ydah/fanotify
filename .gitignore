@@ -13,3 +13,5 @@
 Gemfile.lock
 .rspec_status
 *.gem
+/site/node_modules/
+/site/public/styles.css

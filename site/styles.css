@@ -1,0 +1,17 @@
+@import "tailwindcss" source(none);
+@source "./public/index.html";
+
+@theme {
+  --font-sans: "IBM Plex Sans", Arial, sans-serif;
+  --font-mono: "IBM Plex Mono", monospace;
+}
+
+@layer base {
+  h1, h2, h3 { @apply text-balance; }
+  p { @apply text-pretty; }
+  a:focus-visible, pre:focus-visible {
+    @apply outline-2 outline-offset-4 outline-rose-700;
+  }
+  section[id], main[id] { @apply scroll-mt-8; }
+  ::selection { @apply bg-rose-100 text-rose-950; }
+}
