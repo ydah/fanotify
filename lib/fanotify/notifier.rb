@@ -371,6 +371,7 @@ module Fanotify
             else
               dead << token
             end
+            event = nil # Do not retain a live event between watchdog polls.
           end
           [live, dead]
         end
